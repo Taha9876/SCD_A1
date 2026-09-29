@@ -1,0 +1,17 @@
+# node_modules is the big one: hundreds of megabytes that npm ci rebuilds from
+# the lockfile anyway, and copying it in would defeat the multi-stage split.
+# Before/after context sizes are recorded in docs/ENGINEERING-NOTES.md.
+node_modules
+dist
+.git
+.github
+coverage
+tests
+.env
+.env.*
+!.env.example
+*.md
+Dockerfile
+.dockerignore
+.eslintrc.cjs
+npm-debug.log*

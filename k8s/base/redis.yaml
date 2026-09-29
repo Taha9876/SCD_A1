@@ -1,0 +1,140 @@
+# Redis: a Deployment plus a PVC.
+#
+# Why a Deployment here and a StatefulSet for Postgres, given both have a
+# volume? Because Redis in this system has no clustering, no replication and no
+# per-pod identity to preserve -- it is a single process with a disk. Scaling it
+# is a design change, not a replica-count change, and `replicas: 1` with
+# `strategy: Recreate` is the honest expression of that.
+#
+# The AOF file still needs a volume. The reason is not "caches need disks" --
+# it is that this Redis does TWO jobs, and only one of them is a cache:
+#
+#   Job 1, stats cache        genuinely disposable. Rebuilt on the next MISS.
+#   Job 2, rate-limit counters  NOT disposable. They are the state of a
+#                             security control. A restart that forgets them
+#                             hands every client a fresh quota, which is the
+#                             control failing open at exactly the moment
+#                             (a crash, a redeploy) an abuser would notice.
+#
+# So: AOF on a volume, appendfsync everysec. Losing up to a second of counters
+# is acceptable; losing all of them is not. Full discussion in
+# docs/ENGINEERING-NOTES.md.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redisdata
+  namespace: civicpulse
+  labels:
+    app.kubernetes.io/name: redis
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: civicpulse
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: cache
+spec:
+  # ClusterIP. An internet-reachable Redis with no password is one of the most
+  # reliably exploited misconfigurations there is.
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: civicpulse
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: cache
+    app.kubernetes.io/part-of: civicpulse
+spec:
+  replicas: 1
+  strategy:
+    # Recreate, not RollingUpdate: two Redis processes must never mount the
+    # same AOF file, and RWO storage would not allow it anyway -- the new pod
+    # would hang Pending while the old one held the volume.
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+        app.kubernetes.io/component: cache
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 1000
+        fsGroup: 1000
+      containers:
+        - name: redis
+          image: redis:7.4.1-alpine
+          args:
+            - redis-server
+            - --appendonly
+            - "yes"
+            - --appendfsync
+            - everysec
+            - --maxmemory
+            - 256mb
+            # noeviction, not allkeys-lru. Under memory pressure an LRU policy
+            # would evict whichever key is coldest -- quite possibly a
+            # rate-limit counter, resetting somebody's quota. Refusing writes
+            # is the safer failure: the stats endpoint degrades to a MISS and
+            # the limiter keeps counting.
+            - --maxmemory-policy
+            - noeviction
+          ports:
+            - name: redis
+              containerPort: 6379
+          volumeMounts:
+            - name: redisdata
+              mountPath: /data
+          startupProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            failureThreshold: 30
+            periodSeconds: 2
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "ping"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 320Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: redisdata
+          persistentVolumeClaim:
+            claimName: redisdata

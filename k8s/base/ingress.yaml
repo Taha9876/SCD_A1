@@ -1,0 +1,45 @@
+# One host, two paths. This is the only object in the namespace with an outside
+# address; everything else is ClusterIP behind it.
+#
+# Local cluster setup (k3d ships Traefik, kind needs ingress-nginx):
+#   k3d cluster create civicpulse -p "8081:80@loadbalancer"
+#   echo "127.0.0.1 civicpulse.local" | sudo tee -a /etc/hosts
+#   open http://civicpulse.local:8081
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: civicpulse
+  namespace: civicpulse
+  labels:
+    app.kubernetes.io/part-of: civicpulse
+  annotations:
+    # Triage legitimately takes seconds. A default 60s read timeout is fine,
+    # but being explicit means nobody has to discover the default the hard way.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "30"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "30"
+    # The backend rate-limits per client IP, so the real client must survive
+    # the hop through the controller.
+    nginx.ingress.kubernetes.io/use-forwarded-headers: "true"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: civicpulse.local
+      http:
+        paths:
+          # /api FIRST. Path matching is longest-prefix, but writing the
+          # specific rule above the catch-all keeps the intent obvious to the
+          # next reader.
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: backend
+                port:
+                  number: 8000
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 8080

@@ -1,0 +1,62 @@
+# Idempotent demo seed. Safe to re-run: the seed keys on content_hash, so a
+# second run inserts nothing.
+#
+# Not part of the prod overlay by default -- production data comes from
+# citizens. Applied explicitly for a demo:
+#
+#   kubectl apply -f k8s/base/seed-job.yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: civicpulse-seed
+  namespace: civicpulse
+  labels:
+    app.kubernetes.io/name: seed
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: seed
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+      containers:
+        - name: seed
+          image: ghcr.io/OWNER/REPO/civicpulse-backend:PLACEHOLDER
+          command: ["python", "-m", "seeds.seed"]
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                configMapKeyRef: { name: civicpulse-config, key: POSTGRES_USER }
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef: { name: civicpulse-config, key: POSTGRES_DB }
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: civicpulse-secrets, key: POSTGRES_PASSWORD }
+            - name: DATABASE_URL
+              value: "postgresql+asyncpg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@postgres-client:5432/$(POSTGRES_DB)"
+            # Deterministic and network-free, so seeding cannot fail because a
+            # provider is rate-limited and cannot burn quota on 36 complaints.
+            - name: TRIAGE_PROVIDER
+              value: "rules"
+          envFrom:
+            - configMapRef:
+                name: civicpulse-config
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

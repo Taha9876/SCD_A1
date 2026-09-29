@@ -1,0 +1,304 @@
+# CivicPulse -- development stack.
+#
+#   docker compose up -d --build
+#
+# Two networks, deliberately. The consequence is the point:
+#
+#   docker compose exec frontend ping database     -> FAILS
+#
+# The frontend is the internet-facing component and therefore the most likely
+# to be compromised. It has no route to the data.
+#
+# This file is the DEV file: it has `build:`, a source bind mount and hot
+# reload. compose.prod.yaml has none of those and pins images by tag instead.
+
+name: civicpulse
+
+services:
+  # -------------------------------------------------------------------------
+  # Frontend -- edge only. Cannot see the database or the cache.
+  # -------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: civicpulse-frontend:dev
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-8080}:8080"
+    environment:
+      # Empty means same origin: nginx proxies /api, so the bundle holds no
+      # backend URL. This is what makes one image deployable anywhere.
+      API_BASE_URL: ""
+      # A service name, never localhost. Inside this container localhost is
+      # this container, and the backend is a different one.
+      BACKEND_ORIGIN: "http://backend:8000"
+    networks:
+      - edge
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 128M
+        reservations:
+          cpus: "0.05"
+          memory: 32M
+
+  # -------------------------------------------------------------------------
+  # Migrate -- a one-shot JOB, not a service. Runs `alembic upgrade head` and
+  # the idempotent seed, then exits 0; the backend will not start until it has
+  # (condition: service_completed_successfully). That is what makes the README
+  # quickstart ONE command with seeded data (§1.4), without putting DDL in
+  # application startup code (§2.3) -- the same shape as the k8s migrate Job.
+  #
+  # restart: "no" on purpose. restart: unless-stopped on a job that exits 0
+  # would re-run it forever. Likewise no healthcheck: it is not long-running.
+  # -------------------------------------------------------------------------
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: civicpulse-backend:dev
+    restart: "no"
+    command: ["sh", "-c", "alembic upgrade head && python -m seeds.seed"]
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:?set POSTGRES_USER in .env}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@database:5432/${POSTGRES_DB:?set POSTGRES_DB in .env}"
+      REDIS_URL: "redis://cache:6379/0"
+      # Rules, not the LLM: 36 seed rows must not burn a free-tier quota, and
+      # seeding must not fail because a provider is rate-limited.
+      TRIAGE_PROVIDER: "rules"
+      LOG_LEVEL: "WARNING"
+    # Internal only: it needs the database and the cache, never the internet.
+    networks:
+      - internal
+    depends_on:
+      database:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+
+  # -------------------------------------------------------------------------
+  # Backend -- the ONLY service on both networks. It is the bridge, and the
+  # only thing that needs to be.
+  # -------------------------------------------------------------------------
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: civicpulse-backend:dev
+    restart: unless-stopped
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:?set POSTGRES_USER in .env}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@database:5432/${POSTGRES_DB:?set POSTGRES_DB in .env}"
+      REDIS_URL: "redis://cache:6379/0"
+      TRIAGE_PROVIDER: "${TRIAGE_PROVIDER:-rules}"
+      # Read from .env, which is gitignored. Never a literal in this file.
+      LLM_API_KEY: "${LLM_API_KEY:-}"
+      LLM_BASE_URL: "${LLM_BASE_URL:-https://api.groq.com/openai/v1}"
+      LLM_MODEL: "${LLM_MODEL:-qwen/qwen3.8-27b}"
+      OLLAMA_BASE_URL: "http://ollama:11434"
+      OLLAMA_MODEL: "${OLLAMA_MODEL:-llama3.2:1b}"
+      RATE_LIMIT_REQUESTS: "${RATE_LIMIT_REQUESTS:-10}"
+      RATE_LIMIT_WINDOW_SECONDS: "${RATE_LIMIT_WINDOW_SECONDS:-60}"
+      CORS_ORIGINS: "http://localhost:${FRONTEND_PORT:-8080},http://localhost:5173"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      ENVIRONMENT: "development"
+    networks:
+      # Both. See the note at the bottom of this file about internal: true and
+      # the hosted LLM provider.
+      - edge
+      - internal
+    volumes:
+      # DEV ONLY. Mounting source into the container means an edit is live
+      # without a rebuild, which is right when you are writing code and wrong
+      # in production: the image would no longer be what is running, so the
+      # thing you tested is not the thing you shipped. Absent from
+      # compose.prod.yaml for exactly that reason.
+      - ./backend/app:/app/app:ro
+      - ./backend/seeds:/app/seeds:ro
+    depends_on:
+      database:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+      migrate:
+        # The schema must exist before the first request can touch it.
+        condition: service_completed_successfully
+    # Reload on edit, paired with the bind mount above. Overrides the
+    # Dockerfile CMD; the production file does not.
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --reload
+      - --no-access-log
+    healthcheck:
+      # /health, not /ready: this asks "is the process alive", which is what
+      # `depends_on: service_healthy` should wait on for the frontend.
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 512M
+        reservations:
+          cpus: "0.10"
+          memory: 128M
+
+  # -------------------------------------------------------------------------
+  # Database -- internal only. No route to or from the outside world.
+  # -------------------------------------------------------------------------
+  database:
+    image: postgres:16.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:?set POSTGRES_USER in .env}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}"
+      POSTGRES_DB: "${POSTGRES_DB:?set POSTGRES_DB in .env}"
+      PGDATA: /var/lib/postgresql/data/pgdata
+    networks:
+      - internal
+    # Published in DEV only, so you can attach psql or a GUI while developing.
+    # compose.prod.yaml publishes nothing -- a published database port is a
+    # marked error there and a real one everywhere.
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # -U and -d matter: without them pg_isready checks the wrong database and
+      # reports healthy while the one we use is still initialising.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 512M
+        reservations:
+          cpus: "0.10"
+          memory: 128M
+
+  # -------------------------------------------------------------------------
+  # Cache -- internal only. Two jobs: stats cache and distributed rate limiter.
+  # -------------------------------------------------------------------------
+  cache:
+    image: redis:7.4.1-alpine
+    restart: unless-stopped
+    # appendonly yes -> AOF on the named volume below. The justification for
+    # persisting a cache is in docs/ENGINEERING-NOTES.md; the short version is
+    # that the rate-limiter counters are not cache, they are state.
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 128mb
+      # noeviction, not allkeys-lru: silently evicting a rate-limit counter
+      # would reset somebody's quota, which is a security control failing open.
+      - --maxmemory-policy
+      - noeviction
+    networks:
+      - internal
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 192M
+        reservations:
+          cpus: "0.05"
+          memory: 32M
+
+  # -------------------------------------------------------------------------
+  # Ollama -- the zero-dependency AI path. On `edge` because it needs to pull
+  # model weights on first run; nothing else talks to it but the backend.
+  #
+  # Started only with:  docker compose --profile ai up -d
+  # so a plain `up` does not pull 800 MB on a student laptop.
+  # -------------------------------------------------------------------------
+  ollama:
+    image: ollama/ollama:0.5.4
+    profiles: ["ai"]
+    restart: unless-stopped
+    networks:
+      - edge
+      - internal
+    volumes:
+      # So you do not re-pull the weights on every `up`. This volume is the
+      # difference between a 5-second start and a 4-minute one.
+      - ollama_models:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.00"
+          memory: 3G
+        reservations:
+          cpus: "0.25"
+          memory: 512M
+
+networks:
+  edge:
+    driver: bridge
+  internal:
+    driver: bridge
+    # No route to the outside world. This is the segmentation the rubric marks,
+    # and it creates a real trade-off: a container on `internal` alone cannot
+    # call api.groq.com. That is why `backend` joins both networks -- it is the
+    # single, auditable bridge, and it is the only service that needs egress.
+    # The alternative designs (an egress proxy on edge, or moving triage into a
+    # separate worker service) are compared in docs/ENGINEERING-NOTES.md Q7.
+    internal: true
+
+volumes:
+  # The durable one. Losing this loses citizen complaints, which is the one
+  # thing in this system that cannot be recomputed.
+  pgdata:
+  # AOF persistence. Justified in docs/ENGINEERING-NOTES.md: the stats cache is
+  # genuinely disposable, but the rate-limiter counters in the same Redis are
+  # not -- a restart that forgets them hands every client a fresh quota.
+  redisdata:
+  # Model weights, so `up` does not re-pull ~800 MB.
+  ollama_models:

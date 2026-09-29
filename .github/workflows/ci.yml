@@ -1,0 +1,415 @@
+name: CI
+
+# On PRs into main and pushes to dev. Never on pushes to main -- by then the
+# checks have already run on the PR, and cd.yml takes over.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [dev]
+
+# Least privilege. The default token can write to the repository; nothing in
+# this workflow needs to, so nothing here can.
+permissions:
+  contents: read
+
+concurrency:
+  # One run per ref. A force-push mid-run cancels the stale one instead of
+  # burning minutes on code nobody will merge.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: '3.12'
+  NODE_VERSION: '22'
+
+jobs:
+  lint-and-type:
+    name: Lint and type check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: pip install -r requirements-dev.txt
+
+      - name: ruff
+        working-directory: backend
+        run: ruff check .
+
+      - name: mypy
+        working-directory: backend
+        run: mypy app
+
+      - name: Frontend types match the backend OpenAPI schema
+        # §2.1: a typed client "checked against the backend's OpenAPI schema".
+        # Builds the app in-process and diffs enums and fields against
+        # frontend/src/api/types.ts -- red the moment they drift.
+        run: python scripts/check_openapi_contract.py
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        # npm ci, not npm install: installs exactly the lockfile. `npm install`
+        # can resolve a newer transitive dependency than the one that was
+        # reviewed, which makes the build non-reproducible.
+        run: npm ci
+
+      - name: eslint
+        working-directory: frontend
+        run: npm run lint
+
+      - name: tsc --noEmit
+        working-directory: frontend
+        run: npm run typecheck
+
+  test-backend:
+    name: Backend tests
+    runs-on: ubuntu-24.04
+    env:
+      # Pinned to the deterministic provider. With TRIAGE_PROVIDER=llm the same
+      # input can give different output, and a suite that is occasionally red
+      # teaches the team to ignore red -- worse than having no suite.
+      TRIAGE_PROVIDER: simulated
+      DATABASE_URL: "sqlite+aiosqlite:///:memory:"
+      REDIS_URL: "redis://unused"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Install dependencies
+        working-directory: backend
+        run: pip install -r requirements-dev.txt
+
+      - name: pytest with coverage
+        working-directory: backend
+        # --cov-fail-under is also set in pyproject.toml; repeating it here
+        # makes the gate visible in the workflow rather than buried in config.
+        run: pytest --cov=app --cov-report=term-missing --cov-report=xml --cov-fail-under=65
+
+      - name: Upload coverage
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-coverage
+          path: backend/coverage.xml
+          retention-days: 7
+
+  test-frontend:
+    name: Frontend tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: vitest
+        working-directory: frontend
+        run: npm test
+
+  build:
+    name: Build images
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # load: true, push: false. A pull request must NOT publish artifacts:
+      # the code has not been reviewed or merged, and a pushed tag is visible
+      # to anything that pulls it.
+      - name: Build backend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: false
+          load: true
+          tags: civicpulse-backend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build frontend image
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: false
+          load: true
+          tags: civicpulse-frontend:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Report image sizes
+        # The frontend must stay small: over ~60 MB means the multi-stage split
+        # is not working and Node has leaked into the runtime image.
+        run: |
+          docker image ls civicpulse-backend:ci --format '{{.Repository}}:{{.Tag}} {{.Size}}'
+          docker image ls civicpulse-frontend:ci --format '{{.Repository}}:{{.Tag}} {{.Size}}'
+
+      - name: Assert no Node toolchain in the frontend runtime image
+        # A direct check on the property the multi-stage build exists to give.
+        run: |
+          if docker run --rm --entrypoint sh civicpulse-frontend:ci -c 'command -v node' 2>/dev/null; then
+            echo "::error::node found in the frontend runtime image; the build stage has leaked"
+            exit 1
+          fi
+          echo "no node in the runtime image, as intended"
+
+      - name: Assert containers do not run as root
+        run: |
+          for image in civicpulse-backend:ci civicpulse-frontend:ci; do
+            uid=$(docker run --rm --entrypoint id "$image" -u)
+            echo "$image runs as uid $uid"
+            if [ "$uid" = "0" ]; then
+              echo "::error::$image runs as root"
+              exit 1
+            fi
+          done
+
+      - name: Save images for the scan job
+        run: |
+          docker save civicpulse-backend:ci  -o /tmp/backend.tar
+          docker save civicpulse-frontend:ci -o /tmp/frontend.tar
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ci-images
+          path: /tmp/*.tar
+          retention-days: 1
+
+  scan:
+    name: Trivy image scan
+    runs-on: ubuntu-24.04
+    # Scanning an image that failed to build is not a useful signal.
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ci-images
+          path: /tmp
+
+      - name: Load images
+        run: |
+          docker load -i /tmp/backend.tar
+          docker load -i /tmp/frontend.tar
+
+      - name: Scan backend
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          image-ref: civicpulse-backend:ci
+          format: table
+          exit-code: '1'
+          severity: HIGH,CRITICAL
+          # Only fail on something we can actually act on. A HIGH with no fixed
+          # version available is a finding to track, not a merge blocker --
+          # otherwise the gate becomes noise and people start bypassing it.
+          ignore-unfixed: true
+
+      - name: Scan frontend
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          image-ref: civicpulse-frontend:ci
+          format: table
+          exit-code: '1'
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+
+  manifests:
+    name: Validate Kubernetes manifests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kustomize and kubeconform
+        run: |
+          curl -sSL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+          curl -sSL "https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz" \
+            | tar xz kubeconform
+          sudo mv kubeconform /usr/local/bin/
+
+      - name: Build and validate both overlays
+        # Catches a typo'd apiVersion or a misspelled field in 20 seconds,
+        # rather than 15 minutes later as a confusing kubectl error on the
+        # cluster. The VPA and Ingress CRDs are not in the standard schema set,
+        # hence the extra schema location.
+        run: |
+          for overlay in dev prod; do
+            echo "=== $overlay ==="
+            kustomize build "k8s/overlays/$overlay" > "/tmp/$overlay.yaml"
+            kubeconform \
+              --strict \
+              --summary \
+              --ignore-missing-schemas \
+              --schema-location default \
+              --schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+              "/tmp/$overlay.yaml"
+          done
+
+      - name: Assert no real secrets and no :latest in the manifests
+        # PyYAML is required: without it the lint skips these checks and passes.
+        run: |
+          pip install pyyaml==6.0.2
+          python scripts/check_submission.py --only manifests
+
+  integration:
+    name: Compose integration smoke test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write a throwaway .env
+        # Generated, not committed. These credentials exist for 90 seconds
+        # inside one ephemeral runner.
+        run: |
+          cat > .env <<'ENVFILE'
+          POSTGRES_USER=civicpulse
+          POSTGRES_DB=civicpulse
+          FRONTEND_PORT=8080
+          BACKEND_PORT=8000
+          TRIAGE_PROVIDER=simulated
+          RATE_LIMIT_REQUESTS=100
+          RATE_LIMIT_WINDOW_SECONDS=60
+          LOG_LEVEL=INFO
+          ENVFILE
+          echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)" >> .env
+
+      - name: docker compose up
+        run: docker compose up -d --build
+
+      - name: Wait for readiness
+        # /ready, not /health: this asserts Postgres AND Redis are both
+        # reachable, which is what the rest of this job depends on.
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl -fsS http://localhost:8000/ready > /tmp/ready.json 2>/dev/null; then
+              echo "ready after ${attempt}s:"
+              cat /tmp/ready.json
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::backend never became ready"
+          docker compose ps
+          docker compose logs --no-color --tail=100
+          exit 1
+
+      - name: The migrate job ran and succeeded
+        # `up` already migrated and seeded via the one-shot migrate service;
+        # the backend could not have become ready otherwise. Assert it anyway.
+        run: |
+          code=$(docker inspect --format '{{.State.ExitCode}}' "$(docker compose ps -aq migrate)")
+          echo "migrate exit code: $code"
+          test "$code" = "0"
+          # Re-running the migration must be a no-op.
+          docker compose exec -T backend alembic upgrade head
+
+      - name: Seeding twice must change nothing
+        # The seed's idempotency is a claim in the README; this is the check
+        # that keeps it true.
+        run: |
+          before=$(curl -fsS http://localhost:8000/api/stats | python -c 'import sys,json; print(json.load(sys.stdin)["total"])')
+          docker compose exec -T backend python -m seeds.seed
+          after=$(curl -fsS http://localhost:8000/api/stats | python -c 'import sys,json; print(json.load(sys.stdin)["total"])')
+          echo "total before=$before after=$after"
+          test "$before" = "$after" || { echo "::error::seed is not idempotent"; exit 1; }
+
+      - name: POST a complaint, GET it back, assert the triage
+        run: |
+          created=$(curl -fsS -X POST http://localhost:8000/api/complaints \
+            -H 'Content-Type: application/json' \
+            -d '{"text":"Burst water main flooding Street 12 since fajr, water entering ground floors.","location":"Street 12, G-9/4, Islamabad"}')
+          echo "$created" | python -m json.tool
+
+          id=$(echo "$created" | python -c 'import sys,json; print(json.load(sys.stdin)["id"])')
+          category=$(echo "$created" | python -c 'import sys,json; print(json.load(sys.stdin)["category"])')
+          test "$category" = "water" || { echo "::error::expected category=water, got $category"; exit 1; }
+
+          # Round trip: the row is really in Postgres, not just in a response.
+          fetched=$(curl -fsS "http://localhost:8000/api/complaints/$id")
+          echo "$fetched" | python -c 'import sys,json; d=json.load(sys.stdin); assert d["status"]=="open", d'
+
+      - name: Invalid transition must be 409
+        run: |
+          id=$(curl -fsS 'http://localhost:8000/api/complaints?page_size=1' \
+            | python -c 'import sys,json; print(json.load(sys.stdin)["items"][0]["id"])')
+          code=$(curl -s -o /tmp/conflict.json -w '%{http_code}' \
+            -X PATCH "http://localhost:8000/api/complaints/$id/status" \
+            -H 'Content-Type: application/json' -d '{"status":"resolved"}')
+          cat /tmp/conflict.json
+          test "$code" = "409" || { echo "::error::expected 409, got $code"; exit 1; }
+
+      - name: X-Cache must go MISS then HIT
+        run: |
+          # The first read after a write is a MISS because the write invalidated
+          # the key; the second is a HIT.
+          first=$(curl -sS -D - -o /dev/null http://localhost:8000/api/stats | grep -i '^x-cache:' | tr -d '\r')
+          second=$(curl -sS -D - -o /dev/null http://localhost:8000/api/stats | grep -i '^x-cache:' | tr -d '\r')
+          echo "first:  $first"
+          echo "second: $second"
+          echo "$first"  | grep -qi 'MISS' || { echo "::error::expected MISS first"; exit 1; }
+          echo "$second" | grep -qi 'HIT'  || { echo "::error::expected HIT second"; exit 1; }
+
+      - name: Network segmentation -- the frontend must NOT reach the database
+        # A failing command as proof of correct design. If this ever starts
+        # succeeding, the two-network setup has been broken.
+        run: |
+          if docker compose exec -T frontend sh -c 'nc -z -w 3 database 5432' 2>/dev/null; then
+            echo "::error::frontend CAN reach the database; network segmentation is broken"
+            exit 1
+          fi
+          echo "frontend cannot reach the database, as designed"
+
+      - name: Frontend serves the page and proxies /api
+        run: |
+          curl -fsS http://localhost:8080/ | grep -q 'CivicPulse' \
+            || { echo "::error::frontend did not serve index.html"; exit 1; }
+          # Proves the nginx proxy works, which is the whole runtime-config story.
+          curl -fsS http://localhost:8080/api/stats > /dev/null \
+            || { echo "::error::nginx did not proxy /api"; exit 1; }
+          # And that config.js is generated at container start, not baked in.
+          curl -fsS http://localhost:8080/config.js | grep -q '__CIVICPULSE_CONFIG__' \
+            || { echo "::error::config.js was not generated"; exit 1; }
+
+      - name: Logs must be JSON on stdout with a request_id
+        run: |
+          docker compose logs --no-color backend | tail -40
+          docker compose logs --no-color backend \
+            | grep -o '{"timestamp".*}' | tail -1 \
+            | python -c 'import sys,json; d=json.loads(sys.stdin.read()); assert "request_id" in d, d; print("structured log ok:", d.get("event"))'
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose ps && docker compose logs --no-color --tail=200
+
+      - name: Tear down
+        if: always()
+        # -v removes the volumes: a runner that leaks state between runs gives
+        # you a green pipeline that depends on yesterday's data.
+        run: docker compose down -v

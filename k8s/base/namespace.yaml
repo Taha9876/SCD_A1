@@ -1,0 +1,9 @@
+# Everything lives here, never in `default`. A namespace gives you one place to
+# apply quotas and NetworkPolicies, and one command that deletes the whole
+# environment without touching anything else on the cluster.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: civicpulse
+  labels:
+    app.kubernetes.io/part-of: civicpulse

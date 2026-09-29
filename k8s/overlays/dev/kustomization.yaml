@@ -1,0 +1,61 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: civicpulse
+
+resources:
+  - ../../base
+
+# Dev runs one replica of each: a student laptop's k3d cluster does not have the
+# CPU for four pods plus Postgres plus Redis plus metrics-server, and watching
+# the HPA is the only reason to want more.
+#
+# Note the HPA's minReplicas: 2 still wins over the Deployment's replicas: 1 as
+# soon as it reconciles -- which is correct, and worth understanding: the HPA
+# owns the replica count once it exists. The patch below drops the HPA in dev to
+# avoid that confusion.
+patches:
+  - target:
+      kind: Deployment
+      name: backend
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1
+  - target:
+      kind: Deployment
+      name: frontend
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1
+  # Locally built images, loaded straight into the cluster:
+  #   k3d image import civicpulse-backend:dev -c civicpulse
+  # IfNotPresent, or the kubelet tries to pull a tag that exists nowhere.
+  - target:
+      kind: Deployment
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/imagePullPolicy
+        value: IfNotPresent
+
+# Not in dev: the HPA (no load to scale on, and metrics-server may be absent),
+# the VPA (its CRD may not be installed), and the PDBs (with one replica a
+# minAvailable: 1 budget blocks every drain).
+images:
+  - name: ghcr.io/OWNER/REPO/civicpulse-backend
+    newName: civicpulse-backend
+    newTag: dev
+  - name: ghcr.io/OWNER/REPO/civicpulse-frontend
+    newName: civicpulse-frontend
+    newTag: dev
+
+configMapGenerator:
+  - name: civicpulse-config
+    behavior: merge
+    literals:
+      # Deterministic, no key, no network -- so a fresh cluster works before
+      # anybody has signed up for an API key.
+      - TRIAGE_PROVIDER=rules
+      - LOG_LEVEL=DEBUG
+      - ENVIRONMENT=dev

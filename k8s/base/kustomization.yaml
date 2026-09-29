@@ -1,0 +1,34 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: civicpulse
+
+# Applied to every object, so `kubectl get all -l app.kubernetes.io/part-of=civicpulse`
+# finds the whole system and nothing else.
+commonLabels:
+  app.kubernetes.io/part-of: civicpulse
+  app.kubernetes.io/managed-by: kustomize
+
+resources:
+  - namespace.yaml
+  - configmap.yaml
+  - secret.yaml
+  - postgres.yaml
+  - redis.yaml
+  - backend.yaml
+  - frontend.yaml
+  - ingress.yaml
+  - hpa.yaml
+  - vpa.yaml
+  - pdb.yaml
+  - networkpolicy.yaml
+  - migrate-job.yaml
+
+images:
+  # The base carries deliberately invalid placeholders. Each overlay sets the
+  # real repository and an immutable tag, so applying the base by mistake fails
+  # on ImagePullBackOff rather than quietly deploying something unexpected.
+  - name: ghcr.io/OWNER/REPO/civicpulse-backend
+    newTag: PLACEHOLDER
+  - name: ghcr.io/OWNER/REPO/civicpulse-frontend
+    newTag: PLACEHOLDER

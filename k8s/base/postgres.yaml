@@ -1,0 +1,152 @@
+# PostgreSQL as a StatefulSet, not a Deployment.
+#
+# Why this matters enough to be a marked error the other way round:
+#
+#   - Stable identity. A StatefulSet pod is postgres-0 every time. A Deployment
+#     pod is postgres-7d4f9b-x9k2l, and a different name after every restart.
+#   - Stable storage. volumeClaimTemplates binds postgres-0 to ITS PVC, and the
+#     same pod name always gets the same volume back. A Deployment with one PVC
+#     works by accident until you scale it, at which point two Postgres
+#     processes mount the same data directory and corrupt it.
+#   - Ordered, one-at-a-time rollout. A Deployment's default RollingUpdate can
+#     start a second Postgres before the first has released its lock.
+#
+# A Deployment with no PVC at all is worse still: `kubectl delete pod` and
+# every complaint the municipality received is gone.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: civicpulse
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+spec:
+  # Headless: gives postgres-0 a stable DNS name
+  # (postgres-0.postgres.civicpulse.svc.cluster.local) and is required for the
+  # StatefulSet's per-pod identity.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+# ClusterIP, never NodePort or LoadBalancer. Exposing a database outside the
+# cluster is a marked error, and for good reason: there is no legitimate caller
+# out there.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-client
+  namespace: civicpulse
+  labels:
+    app.kubernetes.io/name: postgres
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: civicpulse
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+    app.kubernetes.io/part-of: civicpulse
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/component: database
+    spec:
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70          # postgres in the alpine image
+        runAsGroup: 70
+        fsGroup: 70            # so the mounted PVC is writable by that user
+      containers:
+        - name: postgres
+          image: postgres:16.6-alpine
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef:
+                  name: civicpulse-config
+                  key: POSTGRES_DB
+            - name: POSTGRES_USER
+              valueFrom:
+                configMapKeyRef:
+                  name: civicpulse-config
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: civicpulse-secrets
+                  key: POSTGRES_PASSWORD
+            # A subdirectory, not the mount root: some volume drivers put a
+            # lost+found in the root and initdb refuses a non-empty directory.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+          # Slow first boot is initdb, not failure. Without a startupProbe the
+          # liveness probe would kill it mid-initialisation, forever.
+          startupProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            failureThreshold: 30
+            periodSeconds: 2
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+  # The whole point of a StatefulSet for a database: this template creates a
+  # PVC bound to postgres-0, and `kubectl delete pod postgres-0` gets the same
+  # volume back with every row still in it. You will demonstrate exactly that.
+  volumeClaimTemplates:
+    - metadata:
+        name: pgdata
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi

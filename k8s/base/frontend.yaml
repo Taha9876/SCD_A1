@@ -1,0 +1,128 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: civicpulse
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/component: web
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: frontend
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: civicpulse
+  labels:
+    app.kubernetes.io/name: frontend
+    app.kubernetes.io/component: web
+    app.kubernetes.io/part-of: civicpulse
+spec:
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: frontend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: frontend
+        app.kubernetes.io/component: web
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+      containers:
+        - name: frontend
+          image: ghcr.io/OWNER/REPO/civicpulse-frontend:PLACEHOLDER
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # Empty: the browser calls same-origin /api and nginx proxies it.
+            # This is what lets the SAME image run in dev, CI and here.
+            - name: API_BASE_URL
+              value: ""
+            # A Service DNS name. `localhost` here would mean this pod, and
+            # service-to-service over localhost is a marked error for the very
+            # good reason that it silently works on a laptop and never in a pod.
+            - name: BACKEND_ORIGIN
+              value: "http://backend:8000"
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            failureThreshold: 15
+            periodSeconds: 2
+          # /healthz is served statically by nginx and does NOT proxy to the
+          # backend. A frontend pod should not be restarted because the API is
+          # having a bad minute -- it can still serve the page and show an error.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Also /healthz, not /ready. Readiness here answers "can this pod
+          # serve the bundle", which does not depend on Postgres. The backend's
+          # own readiness already keeps unready API pods out of its Service.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sh", "-c", "sleep 3"]
+          resources:
+            requests:
+              cpu: 20m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # The entrypoint writes config.js into the web root and renders the
+            # nginx config, and nginx itself needs writable temp paths. With
+            # readOnlyRootFilesystem these must be emptyDirs.
+            - name: html-config
+              mountPath: /usr/share/nginx/html/config.js
+              subPath: config.js
+            - name: nginx-conf
+              mountPath: /etc/nginx/conf.d
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: html-config
+          emptyDir: {}
+        - name: nginx-conf
+          emptyDir: {}
+        - name: nginx-cache
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

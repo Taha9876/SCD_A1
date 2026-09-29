@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CivicPulse</title>
+    <!--
+      Loaded BEFORE the bundle and deliberately not bundled. nginx generates
+      this file at container start from environment variables, so one image
+      runs in dev, in CI and on the cluster with different backends.
+      See docs/adr/0002-frontend-runtime-config.md.
+    -->
+    <script src="/config.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

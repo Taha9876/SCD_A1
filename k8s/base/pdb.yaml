@@ -1,0 +1,36 @@
+# PodDisruptionBudget: at least one backend must stay up through VOLUNTARY
+# disruption -- a node drain, a cluster upgrade, a `kubectl drain` during
+# maintenance.
+#
+# minAvailable: 1 rather than a percentage, because the HPA changes the replica
+# count constantly and a percentage of a moving number is hard to reason about
+# at 3am. One pod is the floor; the rolling update's maxUnavailable: 0 handles
+# the deploy case separately.
+#
+# Note what this does NOT protect against: a node failing, an OOM kill, a
+# crash. Those are involuntary and no budget can prevent them.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: backend-pdb
+  namespace: civicpulse
+  labels:
+    app.kubernetes.io/name: backend
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: backend
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: frontend-pdb
+  namespace: civicpulse
+  labels:
+    app.kubernetes.io/name: frontend
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: frontend

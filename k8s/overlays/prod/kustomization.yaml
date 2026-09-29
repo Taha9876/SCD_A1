@@ -1,0 +1,47 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: civicpulse
+
+resources:
+  - ../../base
+  - resource-governance.yaml
+
+# IMAGE TAGS ARE SET BY CI, NOT COMMITTED HERE.
+#
+# cd.yml runs, from this directory:
+#   kustomize edit set image \
+#     ghcr.io/OWNER/REPO/civicpulse-backend=ghcr.io/${REPO}/civicpulse-backend:${GITHUB_SHA}
+#
+# The tag is a commit SHA -- an immutable reference. Deploying `latest` is a
+# marked error because the tag moves: two pods started an hour apart can run
+# different code with nothing in the cluster recording which. "What is
+# production running?" must be answerable with `git show <sha>`.
+#
+# For the bonus, use the digest instead of the SHA tag: a tag is still a
+# mutable pointer at the registry, a digest is content-addressed and cannot be
+# repointed at different bytes.
+images:
+  - name: ghcr.io/OWNER/REPO/civicpulse-backend
+    newTag: PLACEHOLDER_SET_BY_CI
+  - name: ghcr.io/OWNER/REPO/civicpulse-frontend
+    newTag: PLACEHOLDER_SET_BY_CI
+
+configMapGenerator:
+  - name: civicpulse-config
+    behavior: merge
+    literals:
+      - TRIAGE_PROVIDER=llm
+      - LOG_LEVEL=INFO
+      - ENVIRONMENT=production
+
+# The committed Secret holds placeholders only. In a real deployment it is
+# replaced out of band:
+#
+#   kubectl create secret generic civicpulse-secrets -n civicpulse \
+#     --from-literal=POSTGRES_PASSWORD="$POSTGRES_PASSWORD" \
+#     --from-literal=LLM_API_KEY="$LLM_API_KEY" \
+#     --dry-run=client -o yaml | kubectl apply -f -
+#
+# CI takes both from GitHub Secrets. A real key committed here, even
+# base64-encoded, is a -15 deduction: base64 is encoding, not encryption.

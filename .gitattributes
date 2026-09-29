@@ -1,0 +1,17 @@
+# Normalise to LF in the repository. A CRLF shell script fails inside a
+# Linux container with `bad interpreter: no such file or directory`, which
+# is a confusing way to lose an hour when you develop on Windows.
+* text=auto eol=lf
+
+# Never touched.
+*.png binary
+*.jpg binary
+*.gif binary
+*.pdf binary
+*.ico binary
+
+# Must be LF: these are executed by a Linux shell.
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf

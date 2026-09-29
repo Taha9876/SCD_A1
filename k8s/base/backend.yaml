@@ -1,0 +1,166 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend
+  namespace: civicpulse
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/component: api
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: backend
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: civicpulse
+  labels:
+    app.kubernetes.io/name: backend
+    app.kubernetes.io/component: api
+    app.kubernetes.io/part-of: civicpulse
+spec:
+  # A floor of 2, so a node drain or a single crash never takes the API to zero.
+  # The HPA raises this; it must never be set to 1 here or the HPA's
+  # minReplicas: 2 and this value fight on every apply.
+  replicas: 2
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: backend
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # maxUnavailable: 0 is the zero-downtime setting: Kubernetes must bring a
+      # new ready pod up BEFORE it removes an old one, so capacity never dips
+      # below `replicas` during a rollout. maxSurge: 1 keeps it to one extra pod
+      # at a time, which is gentle on a student laptop's cluster.
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: backend
+        app.kubernetes.io/component: api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Must exceed the app's DRAIN_TIMEOUT_SECONDS (20s in app/main.py) plus
+      # the preStop sleep (5s). Too short and the kubelet SIGKILLs the process
+      # mid-drain, which throws away the whole point of handling SIGTERM.
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+      containers:
+        - name: backend
+          image: ghcr.io/OWNER/REPO/civicpulse-backend:PLACEHOLDER
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            # Assembled here rather than stored whole, so the password comes
+            # from the Secret and everything else from the ConfigMap. A full
+            # DSN in a ConfigMap would put the password in a ConfigMap.
+            - name: POSTGRES_USER
+              valueFrom:
+                configMapKeyRef: { name: civicpulse-config, key: POSTGRES_USER }
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef: { name: civicpulse-config, key: POSTGRES_DB }
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: civicpulse-secrets, key: POSTGRES_PASSWORD }
+            - name: DATABASE_URL
+              value: "postgresql+asyncpg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@postgres-client:5432/$(POSTGRES_DB)"
+            - name: LLM_API_KEY
+              valueFrom:
+                secretKeyRef: { name: civicpulse-secrets, key: LLM_API_KEY }
+          envFrom:
+            - configMapRef:
+                name: civicpulse-config
+          # --- The three probes, and they are three different questions ------
+          #
+          # startupProbe: "has it finished booting?" 30 x 2s = up to 60s of
+          # grace. This is what stops a slow start from being read as a failure
+          # and looping forever. While it runs, liveness and readiness are held
+          # off entirely.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            failureThreshold: 30
+            periodSeconds: 2
+          # livenessProbe: "is this process wedged?" Failing it RESTARTS the
+          # pod, so it must depend on nothing external. /health touches no
+          # database by design -- if it did, a Postgres blip would restart every
+          # backend pod simultaneously and make recovery strictly slower.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # readinessProbe: "can this pod serve a request right now?" Failing it
+          # removes the pod from the Service endpoints WITHOUT killing it, so a
+          # pod that has lost Postgres stops taking traffic and rejoins by
+          # itself when the dependency returns. /ready checks both Postgres and
+          # Redis and names the failure in its 503 body.
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+            successThreshold: 1
+          lifecycle:
+            preStop:
+              exec:
+                # Endpoint removal is eventually consistent: kube-proxy and the
+                # Ingress controller need a moment to stop routing here. Without
+                # this sleep the process begins draining while traffic is still
+                # arriving, and those requests are the ones a rolling update
+                # drops. Sleep first, THEN let SIGTERM through.
+                command: ["sh", "-c", "sleep 5"]
+          # --- Resources ----------------------------------------------------
+          # requests are MANDATORY, not optional tidiness. The HPA computes
+          # utilisation as usage / request, so with no request there is no
+          # denominator and `kubectl get hpa` sits at <unknown>/60% forever.
+          # This three-line block is the single most common cause of a "broken
+          # HPA". The values here are the initial guess; VPA's recommendation
+          # and the revision are recorded in docs/ENGINEERING-NOTES.md Q5-Q6.
+          resources:
+            requests:
+              cpu: 100m
+              memory: 192Mi
+            limits:
+              # 5x the CPU request on purpose: a triage call is bursty, and a
+              # limit close to the request would get it CFS-throttled into the
+              # 10s timeout. The memory limit is a hard OOM-kill boundary, so it
+              # also carries headroom over the request.
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # readOnlyRootFilesystem needs a writable /tmp for anything that
+            # buffers to disk. An emptyDir, so it dies with the pod.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

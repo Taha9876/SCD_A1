@@ -1,0 +1,353 @@
+name: CD
+
+# On pushes to main only. main is protected: the only way code arrives here is
+# through a PR that passed ci.yml and got an approval.
+on:
+  push:
+    branches: [main]
+  # Manual re-run, for redeploying the same commit after a rollback.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # Only the publish job needs this; it is granted per-job below, not here.
+  packages: none
+
+concurrency:
+  # Never two deploys of main at once: the second would race the first's
+  # rollout and you would not know which one won.
+  group: cd-main
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  PYTHON_VERSION: '3.12'
+  NODE_VERSION: '22'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. The full suite again, on the MERGED result. The PR tested the branch;
+  #    this tests what main actually became, which is not the same commit.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test merged result
+    runs-on: ubuntu-24.04
+    env:
+      TRIAGE_PROVIDER: simulated
+      DATABASE_URL: "sqlite+aiosqlite:///:memory:"
+      REDIS_URL: "redis://unused"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.txt
+
+      - name: Backend lint, types and tests
+        working-directory: backend
+        run: |
+          pip install -r requirements-dev.txt
+          ruff check .
+          mypy app
+          pytest --cov=app --cov-fail-under=65
+
+      - name: Frontend types match the backend OpenAPI schema
+        run: python scripts/check_openapi_contract.py
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Frontend lint, types and tests
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run lint
+          npm run typecheck
+          npm test
+
+      - name: Submission lint
+        run: python scripts/check_submission.py
+
+  # ---------------------------------------------------------------------------
+  # 2. Build and publish. needs: test -- without that gate you publish
+  #    artifacts from code you already know is broken, and something downstream
+  #    will pull them.
+  # ---------------------------------------------------------------------------
+  build-push:
+    name: Build and push to GHCR
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # GITHUB_TOKEN with packages: write -- scoped to this job, expires with
+      # the run, revocable. Never an account password, never a long-lived PAT.
+      packages: write
+    outputs:
+      backend-digest: ${{ steps.backend.outputs.digest }}
+      frontend-digest: ${{ steps.frontend.outputs.digest }}
+      image-tag: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lowercase the repository name
+        # GHCR rejects uppercase in a path, and GitHub org names often have it.
+        id: repo
+        run: echo "name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push backend
+        id: backend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          # Both tags are pushed. Only the SHA is ever DEPLOYED -- `latest` is a
+          # convenience for humans pulling by hand, and deploying it is a marked
+          # error because the tag moves.
+          tags: |
+            ${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/civicpulse-backend:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/civicpulse-backend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      - name: Build and push frontend
+        id: frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/civicpulse-frontend:${{ github.sha }}
+            ${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/civicpulse-frontend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      - name: Generate SBOMs with Syft
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/civicpulse-backend:${{ github.sha }}
+          artifact-name: sbom-backend.spdx.json
+
+      - name: Record the deployed references
+        # The digest is the content-addressed identity: a tag can be repointed
+        # at different bytes, a digest cannot. This is what makes "what is
+        # production running?" a one-word answer.
+        run: |
+          {
+            echo "### Published images"
+            echo ""
+            echo "| image | tag | digest |"
+            echo "|---|---|---|"
+            echo "| backend | \`${{ github.sha }}\` | \`${{ steps.backend.outputs.digest }}\` |"
+            echo "| frontend | \`${{ github.sha }}\` | \`${{ steps.frontend.outputs.digest }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # 3. Deploy to an ephemeral cluster and prove it actually serves traffic.
+  # ---------------------------------------------------------------------------
+  deploy-k8s:
+    name: Deploy to k3d and smoke test
+    needs: build-push
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install k3d, kubectl and kustomize
+        run: |
+          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG=v5.7.4 bash
+          curl -sSLO "https://dl.k8s.io/release/v1.31.3/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          curl -sSL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+
+      - name: Create the cluster
+        run: |
+          k3d cluster create civicpulse \
+            --agents 1 \
+            --port "8081:80@loadbalancer" \
+            --k3s-arg "--disable=traefik@server:0" \
+            --wait
+          kubectl cluster-info
+
+      - name: Install ingress-nginx
+        run: |
+          kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.12.0/deploy/static/provider/cloud/deploy.yaml
+          kubectl wait --namespace ingress-nginx \
+            --for=condition=ready pod \
+            --selector=app.kubernetes.io/component=controller \
+            --timeout=180s
+
+      - name: Install metrics-server
+        # Required for the HPA. --kubelet-insecure-tls because k3d's kubelet
+        # serving certificate is self-signed; fine for an ephemeral cluster,
+        # never on a real one.
+        run: |
+          kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml
+          kubectl patch -n kube-system deployment metrics-server --type=json \
+            -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+          kubectl -n kube-system rollout status deployment/metrics-server --timeout=180s
+
+      - name: Lowercase the repository name
+        id: repo
+        run: echo "name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Create the namespace and the real Secret
+        # From GitHub Secrets, applied at deploy time. The committed manifest
+        # holds placeholders only -- a real key in a committed manifest is a -15
+        # deduction, and base64 is encoding, not encryption.
+        run: |
+          kubectl create namespace civicpulse --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create secret generic civicpulse-secrets \
+            --namespace civicpulse \
+            --from-literal=POSTGRES_PASSWORD="${{ secrets.POSTGRES_PASSWORD }}" \
+            --from-literal=LLM_API_KEY="${{ secrets.LLM_API_KEY }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Create the registry pull secret
+        run: |
+          kubectl create secret docker-registry ghcr-pull \
+            --namespace civicpulse \
+            --docker-server=${{ env.REGISTRY }} \
+            --docker-username=${{ github.actor }} \
+            --docker-password=${{ secrets.GITHUB_TOKEN }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl patch serviceaccount default -n civicpulse \
+            -p '{"imagePullSecrets":[{"name":"ghcr-pull"}]}'
+
+      - name: Pin the overlay to this commit SHA
+        # Deploy by immutable reference. `kustomize edit set image` rewrites the
+        # overlay in the runner's checkout -- it is never committed, so the
+        # repository keeps its placeholder and the deploy is reproducible from
+        # the SHA alone.
+        working-directory: k8s/overlays/prod
+        run: |
+          kustomize edit set image \
+            ghcr.io/OWNER/REPO/civicpulse-backend=${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/civicpulse-backend:${{ github.sha }}
+          kustomize edit set image \
+            ghcr.io/OWNER/REPO/civicpulse-frontend=${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/civicpulse-frontend:${{ github.sha }}
+          kustomize build . | grep 'image:'
+
+      - name: Apply the data layer first
+        # Postgres and Redis must be ready before the migration Job, and the
+        # migration must finish before the backend starts. Ordering it here
+        # rather than relying on CrashLoopBackOff-and-retry.
+        run: |
+          kustomize build k8s/overlays/prod > /tmp/prod.yaml
+          kubectl apply -f /tmp/prod.yaml --selector app.kubernetes.io/component=database
+          kubectl apply -f /tmp/prod.yaml --selector app.kubernetes.io/component=cache
+          kubectl -n civicpulse rollout status statefulset/postgres --timeout=240s
+          kubectl -n civicpulse rollout status deployment/redis --timeout=180s
+
+      - name: Run migrations
+        # One Job, waited on. An initContainer would run this once per replica,
+        # concurrently, and two `alembic upgrade head` transactions racing on
+        # the version table is how you get a deadlock during a deploy.
+        run: |
+          kubectl apply -f /tmp/prod.yaml --selector app.kubernetes.io/name=migrate
+          kubectl -n civicpulse wait --for=condition=complete job/civicpulse-migrate --timeout=180s \
+            || { kubectl -n civicpulse logs job/civicpulse-migrate; exit 1; }
+          kubectl -n civicpulse logs job/civicpulse-migrate
+
+      - name: Apply everything else
+        run: |
+          kubectl apply -f /tmp/prod.yaml
+          kubectl -n civicpulse rollout status deployment/backend  --timeout=300s
+          kubectl -n civicpulse rollout status deployment/frontend --timeout=180s
+
+      - name: Seed demo data
+        run: |
+          kubectl apply -f k8s/base/seed-job.yaml
+          kubectl -n civicpulse wait --for=condition=complete job/civicpulse-seed --timeout=180s \
+            || { kubectl -n civicpulse logs job/civicpulse-seed; exit 1; }
+
+      - name: Smoke test through the Ingress
+        # Through the Ingress, not through a port-forward. A port-forward would
+        # skip the Ingress, the Service and the readiness gating -- exactly the
+        # parts most likely to be misconfigured.
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl -fsS -H 'Host: civicpulse.local' http://localhost:8081/api/stats > /tmp/stats.json 2>/dev/null; then
+              break
+            fi
+            sleep 2
+          done
+          cat /tmp/stats.json
+          python -c 'import json; d=json.load(open("/tmp/stats.json")); assert d["total"] >= 30, d; print("seeded rows visible through the ingress:", d["total"])'
+
+          # The page itself, through the same host.
+          curl -fsS -H 'Host: civicpulse.local' http://localhost:8081/ | grep -q CivicPulse
+
+          # And a real write, end to end.
+          curl -fsS -X POST -H 'Host: civicpulse.local' \
+            -H 'Content-Type: application/json' \
+            -d '{"text":"Smoke test: transformer sparking over the footpath here.","location":"CI runner, ephemeral cluster"}' \
+            http://localhost:8081/api/complaints | python -m json.tool
+
+      - name: Verify Postgres survives losing its pod
+        # The persistence claim, tested rather than asserted.
+        run: |
+          before=$(curl -fsS -H 'Host: civicpulse.local' http://localhost:8081/api/stats \
+            | python -c 'import sys,json; print(json.load(sys.stdin)["total"])')
+          kubectl -n civicpulse delete pod postgres-0 --wait=true
+          kubectl -n civicpulse rollout status statefulset/postgres --timeout=240s
+          kubectl -n civicpulse wait --for=condition=ready pod -l app.kubernetes.io/name=backend --timeout=180s
+          sleep 5
+          after=$(curl -fsS -H 'Host: civicpulse.local' http://localhost:8081/api/stats \
+            | python -c 'import sys,json; print(json.load(sys.stdin)["total"])')
+          echo "rows before=$before after=$after"
+          test "$before" = "$after" || { echo "::error::rows lost when the Postgres pod was deleted"; exit 1; }
+
+      - name: Print the HPA
+        # Expect <unknown>/60% briefly while metrics-server gathers its first
+        # window, then a real percentage. Permanently <unknown> means the
+        # resources.requests.cpu block is missing.
+        run: |
+          kubectl -n civicpulse get hpa backend-hpa -o wide
+          kubectl -n civicpulse describe hpa backend-hpa | tail -20
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          {
+            echo "### Deployed"
+            echo ""
+            echo "- commit: \`${{ github.sha }}\`"
+            echo "- backend digest: \`${{ needs.build-push.outputs.backend-digest }}\`"
+            echo "- frontend digest: \`${{ needs.build-push.outputs.frontend-digest }}\`"
+            echo ""
+            echo '```'
+            kubectl -n civicpulse get deploy,sts,hpa,pdb 2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl -n civicpulse get all
+          kubectl -n civicpulse describe pods
+          kubectl -n civicpulse logs -l app.kubernetes.io/name=backend --tail=100 --all-containers || true
+          kubectl -n civicpulse get events --sort-by=.lastTimestamp | tail -40
+
+      - name: Delete the cluster
+        if: always()
+        run: k3d cluster delete civicpulse

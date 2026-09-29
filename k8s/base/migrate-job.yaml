@@ -1,0 +1,69 @@
+# Schema migration as a Job, run BEFORE the backend rollout.
+#
+# Why a Job and not an initContainer on the Deployment: with replicas: 2 an
+# initContainer runs the migration twice, concurrently, and two `alembic upgrade
+# head` transactions racing on the same version table is how you get a deadlock
+# at the worst possible moment. One Job, one runner, waited on:
+#
+#   kubectl apply -f migrate-job.yaml
+#   kubectl wait --for=condition=complete job/civicpulse-migrate -n civicpulse --timeout=120s
+#   kubectl apply -k overlays/prod
+#
+# cd.yml does exactly that.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: civicpulse-migrate
+  namespace: civicpulse
+  labels:
+    app.kubernetes.io/name: migrate
+    app.kubernetes.io/component: schema
+spec:
+  # A failing migration should stop and be looked at, not retry forever against
+  # a schema it has already half-applied.
+  backoffLimit: 2
+  # Clean up 10 minutes after finishing, so a re-apply is not blocked by the
+  # previous immutable Job object.
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: migrate
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+      containers:
+        - name: migrate
+          image: ghcr.io/OWNER/REPO/civicpulse-backend:PLACEHOLDER
+          # The same image as the backend. Migrations that ship in a different
+          # artifact than the code drift from it.
+          command: ["alembic", "upgrade", "head"]
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                configMapKeyRef: { name: civicpulse-config, key: POSTGRES_USER }
+            - name: POSTGRES_DB
+              valueFrom:
+                configMapKeyRef: { name: civicpulse-config, key: POSTGRES_DB }
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef: { name: civicpulse-secrets, key: POSTGRES_PASSWORD }
+            # alembic/env.py reads DATABASE_URL and refuses to guess if it is
+            # unset, rather than migrating something unexpected.
+            - name: DATABASE_URL
+              value: "postgresql+asyncpg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@postgres-client:5432/$(POSTGRES_DB)"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

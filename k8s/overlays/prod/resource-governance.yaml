@@ -1,0 +1,43 @@
+# Resource quota for the namespace.
+#
+# Present in prod and not in dev because the HPA can take the backend to 10
+# replicas, and 10 x 500m CPU limit is 5 cores -- more than a small cluster has.
+# A quota turns "the HPA ate the cluster" into "a pod stayed Pending with a clear
+# reason", which is a much better failure to debug at 3am.
+#
+# The numbers are the HPA's maxReplicas (10) times the backend's limits, plus
+# room for the frontend, Postgres, Redis and the migrate Job.
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: civicpulse-quota
+  namespace: civicpulse
+spec:
+  hard:
+    requests.cpu: "3"
+    requests.memory: 4Gi
+    limits.cpu: "8"
+    limits.memory: 8Gi
+    persistentvolumeclaims: "4"
+---
+# Without this, a pod that omits requests is scheduled with none -- and a pod
+# with no CPU request makes the HPA's utilisation calculation undefined for the
+# whole Deployment. The LimitRange means a manifest that forgets the three-line
+# resources block gets a default instead of silently breaking autoscaling.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: civicpulse-defaults
+  namespace: civicpulse
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 200m
+        memory: 256Mi
+      defaultRequest:
+        cpu: 50m
+        memory: 64Mi
+      max:
+        cpu: "2"
+        memory: 2Gi

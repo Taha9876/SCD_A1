@@ -1,0 +1,53 @@
+# Vertical Pod Autoscaler in RECOMMENDER mode on the backend.
+#
+# Install (from the autoscaler repo):
+#   git clone --depth 1 https://github.com/kubernetes/autoscaler.git
+#   cd autoscaler/vertical-pod-autoscaler && ./hack/vpa-up.sh
+#
+# Read the recommendation:
+#   kubectl describe vpa backend-vpa -n civicpulse
+#
+# updateMode "Off" is not timidity, it is the only safe setting alongside a
+# CPU-based HPA, and the failure mode is worth stating precisely:
+#
+#   VPA (Auto) raises the CPU request because the pod is busy
+#     -> utilisation = usage / request DROPS, on the same real load
+#     -> HPA sees low utilisation and scales IN
+#     -> fewer pods carry the same traffic, so per-pod usage RISES
+#     -> VPA raises the request again
+#
+# The two controllers are acting on opposite sides of the same fraction, so they
+# oscillate: replica count and pod size both thrash while the actual load is
+# flat. Recommender mode plus a human reading the number and committing a new
+# request is current industrial practice for exactly this reason -- and the
+# human step is where the capacity-planning judgement lives.
+#
+# The recommendation this produced, and what changed in HPA behaviour after the
+# requests were updated, are recorded in docs/ENGINEERING-NOTES.md Q6.
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: backend-vpa
+  namespace: civicpulse
+  labels:
+    app.kubernetes.io/name: backend
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend
+  updatePolicy:
+    # Recommend only. Never evict a pod to resize it.
+    updateMode: "Off"
+  resourcePolicy:
+    containerPolicies:
+      - containerName: backend
+        # Bound the advice so a pathological load test cannot recommend a pod
+        # larger than any node in the cluster can schedule.
+        minAllowed:
+          cpu: 50m
+          memory: 128Mi
+        maxAllowed:
+          cpu: "2"
+          memory: 1Gi
+        controlledResources: ["cpu", "memory"]

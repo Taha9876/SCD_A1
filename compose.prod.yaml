@@ -1,0 +1,201 @@
+# CivicPulse -- production stack.
+#
+#   IMAGE_TAG=<commit-sha> docker compose -f compose.prod.yaml up -d
+#
+# What is deliberately ABSENT from this file, and why:
+#
+#   build:            Nothing is built here. Images come from the registry,
+#                     already tested and scanned by CI. Building on the
+#                     deployment host means the artifact you run was never the
+#                     artifact you tested.
+#   bind mounts       No source is mounted. The image IS the application.
+#   --reload          A reloader watching a filesystem nothing writes to.
+#   database ports    A published database port is reachable from the host's
+#   cache ports       network. There is no reason for anything but `backend`
+#                     to speak to either, and it does so over `internal`.
+#   :latest           IMAGE_TAG is required and must be an immutable reference
+#                     -- a commit SHA or a digest. "What is production
+#                     running?" must have an answer you can paste into
+#                     `git show`.
+
+name: civicpulse-prod
+
+services:
+  frontend:
+    # ${IMAGE_TAG:?...} fails the command rather than silently defaulting to
+    # latest. Deploying :latest is a marked error and a real incident waiting
+    # to happen: the tag moves, so two pods started an hour apart run different
+    # code with no record of it.
+    image: ghcr.io/${GITHUB_REPOSITORY:?set GITHUB_REPOSITORY}/civicpulse-frontend:${IMAGE_TAG:?set IMAGE_TAG to a commit SHA or digest}
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-80}:8080"
+    environment:
+      API_BASE_URL: ""
+      BACKEND_ORIGIN: "http://backend:8000"
+    networks:
+      - edge
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://localhost:8080/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 128M
+        reservations:
+          cpus: "0.10"
+          memory: 64M
+
+  # One-shot schema migration. No seed here: production data comes from
+  # citizens, not from a demo script. Same image and tag as the backend, so the
+  # migration can never drift from the code that expects it.
+  migrate:
+    image: ghcr.io/${GITHUB_REPOSITORY:?set GITHUB_REPOSITORY}/civicpulse-backend:${IMAGE_TAG:?set IMAGE_TAG to a commit SHA or digest}
+    restart: "no"
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:?set POSTGRES_USER}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@database:5432/${POSTGRES_DB:?set POSTGRES_DB}"
+    networks:
+      - internal
+    depends_on:
+      database:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+
+  backend:
+    image: ghcr.io/${GITHUB_REPOSITORY:?set GITHUB_REPOSITORY}/civicpulse-backend:${IMAGE_TAG:?set IMAGE_TAG to a commit SHA or digest}
+    restart: unless-stopped
+    # No published port either: the frontend proxies /api over `edge`, so
+    # nothing outside the compose project needs to reach the API directly.
+    expose:
+      - "8000"
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER:?set POSTGRES_USER}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@database:5432/${POSTGRES_DB:?set POSTGRES_DB}"
+      REDIS_URL: "redis://cache:6379/0"
+      TRIAGE_PROVIDER: "${TRIAGE_PROVIDER:-llm}"
+      LLM_API_KEY: "${LLM_API_KEY:?set LLM_API_KEY in the environment, never in a file in Git}"
+      LLM_BASE_URL: "${LLM_BASE_URL:-https://api.groq.com/openai/v1}"
+      LLM_MODEL: "${LLM_MODEL:-qwen/qwen3.8-27b}"
+      RATE_LIMIT_REQUESTS: "${RATE_LIMIT_REQUESTS:-10}"
+      RATE_LIMIT_WINDOW_SECONDS: "${RATE_LIMIT_WINDOW_SECONDS:-60}"
+      CORS_ORIGINS: "${CORS_ORIGINS:-http://localhost}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      ENVIRONMENT: "production"
+    networks:
+      - edge
+      - internal
+    depends_on:
+      database:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    # No command override: the Dockerfile CMD runs, which is the one CI tested.
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 30s
+    # Give the process time to drain in-flight requests on SIGTERM. Must exceed
+    # the app's DRAIN_TIMEOUT_SECONDS (20s) or Compose SIGKILLs it mid-drain.
+    stop_grace_period: 30s
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  database:
+    image: postgres:16.6-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:?set POSTGRES_USER}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}"
+      POSTGRES_DB: "${POSTGRES_DB:?set POSTGRES_DB}"
+      PGDATA: /var/lib/postgresql/data/pgdata
+    networks:
+      - internal
+    # NO ports: block. Nothing but `backend` may reach 5432, and it does so
+    # over the internal network by service name.
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+    # A database killed mid-write recovers from its WAL, but cleanly is better.
+    stop_grace_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 1G
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+
+  cache:
+    image: redis:7.4.1-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 256mb
+      - --maxmemory-policy
+      - noeviction
+    networks:
+      - internal
+    # NO ports: block, for the same reason as the database. An exposed Redis
+    # with no password is one of the most reliably exploited misconfigurations
+    # on the internet.
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 320M
+        reservations:
+          cpus: "0.10"
+          memory: 64M
+
+networks:
+  edge:
+    driver: bridge
+  internal:
+    driver: bridge
+    internal: true
+
+volumes:
+  pgdata:
+  redisdata:
