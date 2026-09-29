@@ -3,8 +3,8 @@
 Municipal complaint intake, AI triage and operations — five cooperating
 containers locally, an autoscaling workload on Kubernetes in CI.
 
-[![CI](https://github.com/Taha9876/SCD_A1/actions/workflows/ci.yml/badge.svg)](https://github.com/Taha9876/SCD_A1/actions/workflows/ci.yml)
-[![CD](https://github.com/Taha9876/SCD_A1/actions/workflows/cd.yml/badge.svg)](https://github.com/Taha9876/SCD_A1/actions/workflows/cd.yml)
+[![CI](https://github.com/i222641-byte/SCD_A1/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/i222641-byte/SCD_A1/actions/workflows/ci.yml)
+[![CD](https://github.com/i222641-byte/SCD_A1/actions/workflows/cd.yml/badge.svg?branch=main)](https://github.com/i222641-byte/SCD_A1/actions/workflows/cd.yml)
 [![coverage](https://img.shields.io/badge/backend%20coverage-88%25-brightgreen)](#testing)
 [![license](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
@@ -95,7 +95,7 @@ One command, from a clean clone, with seeded data.
 API key.
 
 ```bash
-git clone https://github.com/Taha9876/SCD_A1.git civicpulse
+git clone https://github.com/i222641-byte/SCD_A1.git civicpulse
 cd civicpulse
 
 cp .env.example .env        # then change POSTGRES_PASSWORD for anything real
