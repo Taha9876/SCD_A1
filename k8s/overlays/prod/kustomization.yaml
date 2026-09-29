@@ -27,13 +27,39 @@ images:
   - name: ghcr.io/OWNER/REPO/civicpulse-frontend
     newTag: PLACEHOLDER_SET_BY_CI
 
-configMapGenerator:
-  - name: civicpulse-config
-    behavior: merge
-    literals:
-      - TRIAGE_PROVIDER=llm
-      - LOG_LEVEL=INFO
-      - ENVIRONMENT=production
+# Environment-specific configuration, as a patch on the base ConfigMap.
+#
+# Not a configMapGenerator with `behavior: merge`: a generator can only merge
+# into another generator's output, never into a ConfigMap declared as a plain
+# resource, so that version failed with "civicpulse-config does not exist;
+# cannot merge or replace" and the overlay never rendered at all. A patch
+# also avoids the hash suffix a generator appends to the name.
+patches:
+  - target:
+      kind: ConfigMap
+      name: civicpulse-config
+    patch: |-
+      - op: replace
+        path: /data/TRIAGE_PROVIDER
+        value: llm
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: INFO
+      - op: replace
+        path: /data/ENVIRONMENT
+        value: production
+  # Drop the base's placeholder Secret from production. The real one is created
+  # out of band (by cd.yml from GitHub Secrets, see below) BEFORE this overlay
+  # is applied; if the overlay also carried base/secret.yaml, `kubectl apply`
+  # would overwrite the real password with REPLACE_ME_... and the backend would
+  # fail to authenticate to a Postgres already initialised with the real one.
+  - patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Secret
+      metadata:
+        name: civicpulse-secrets
+        namespace: civicpulse
 
 # The committed Secret holds placeholders only. In a real deployment it is
 # replaced out of band:

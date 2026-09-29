@@ -39,6 +39,17 @@ import { Counter, Rate, Trend } from 'k6/metrics'
 
 const BASE_URL = __ENV.BASE_URL || 'http://civicpulse.local:8081'
 
+// Optional. The Ingress routes on host civicpulse.local; set HOST_HEADER to
+// target it through an IP or localhost without editing /etc/hosts (which needs
+// admin rights on Windows):
+//   k6 run --env BASE_URL=http://localhost:8081 --env HOST_HEADER=civicpulse.local ...
+const HOST_HEADER = __ENV.HOST_HEADER
+
+function withHost(params) {
+  if (!HOST_HEADER) return params
+  return { ...params, headers: { ...(params.headers || {}), Host: HOST_HEADER } }
+}
+
 const cacheHits = new Counter('civicpulse_stats_cache_hits')
 const cacheMisses = new Counter('civicpulse_stats_cache_misses')
 const rateLimited = new Counter('civicpulse_rate_limited')
@@ -89,13 +100,14 @@ function pick(list) {
 
 export default function () {
   // --- Read path: what the autoscaler is actually being measured on ---------
-  const list = http.get(`${BASE_URL}/api/complaints?page=1&page_size=10`, {
-    tags: { name: 'GET /api/complaints' },
-  })
+  const list = http.get(
+    `${BASE_URL}/api/complaints?page=1&page_size=10`,
+    withHost({ tags: { name: 'GET /api/complaints' } }),
+  )
   failed.add(list.status !== 200)
   check(list, { 'list returns 200': (r) => r.status === 200 })
 
-  const stats = http.get(`${BASE_URL}/api/stats`, { tags: { name: 'GET /api/stats' } })
+  const stats = http.get(`${BASE_URL}/api/stats`, withHost({ tags: { name: 'GET /api/stats' } }))
   failed.add(stats.status !== 200)
   check(stats, { 'stats returns 200': (r) => r.status === 200 })
 
@@ -111,10 +123,10 @@ export default function () {
       text: `${pick(COMPLAINTS)} Ref ${__VU}-${__ITER}.`,
       location: pick(LOCATIONS),
     })
-    const created = http.post(`${BASE_URL}/api/complaints`, payload, {
+    const created = http.post(`${BASE_URL}/api/complaints`, payload, withHost({
       headers: { 'Content-Type': 'application/json' },
       tags: { name: 'POST /api/complaints' },
-    })
+    }))
 
     if (created.status === 429) {
       // Not a failure. The limiter doing its job is a pass.

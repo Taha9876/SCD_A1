@@ -3,11 +3,19 @@ kind: Kustomization
 
 namespace: civicpulse
 
-# Applied to every object, so `kubectl get all -l app.kubernetes.io/part-of=civicpulse`
-# finds the whole system and nothing else.
-commonLabels:
-  app.kubernetes.io/part-of: civicpulse
-  app.kubernetes.io/managed-by: kustomize
+# Applied to every object and pod template, so
+# `kubectl get all -l app.kubernetes.io/part-of=civicpulse` finds the whole
+# system and nothing else.
+#
+# `labels` rather than the deprecated `commonLabels`, and deliberately NOT added
+# to selectors: a Deployment's selector is immutable once created, so baking
+# these into selectors would make any future label change a delete-and-recreate.
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: civicpulse
+      app.kubernetes.io/managed-by: kustomize
+    includeSelectors: false
+    includeTemplates: true
 
 resources:
   - namespace.yaml

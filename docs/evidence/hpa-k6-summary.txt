@@ -1,0 +1,11 @@
+
+CivicPulse load summary
+-----------------------
+  /api/stats cache      18414 HIT / 177 MISS  (99.0% hit rate)
+  429 responses         218 (expected: the limiter working)
+  failed request rate   0.00%
+  p95 latency           47 ms
+
+Now put the replica timeline from `kubectl get hpa -w` next to this run's
+start time. The gap between the 1m step and the first replica increase is your
+HPA lag -- write it into docs/ENGINEERING-NOTES.md Q5.

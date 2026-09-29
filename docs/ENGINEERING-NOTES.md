@@ -163,18 +163,60 @@ provider that always raises, `POST /api/complaints` still returns 201 and
 
 ---
 
-## 5. HPA lag **[MEASURE]**
+## 5. HPA lag
 
-**Setup.** `k6 run --env BASE_URL=http://civicpulse.local:8081 load/k6-script.js`
-with `kubectl get hpa backend-hpa -n civicpulse -w | tee docs/evidence/hpa-watch.txt`
-running alongside. The profile steps from 5 to 60 VUs at t+1m; that step is the
-measurement.
+**Setup.** Measured on 2026-09-29 on a local k3d cluster (1 server, 1 agent),
+deployed with the prod overlay through ingress-nginx, with metrics-server at its
+default resolution. `load/k6-script.js` ran against the Ingress: 5 VUs for a
+minute, a ramp to 60 VUs over the next, then a 3-minute hold.
+`kubectl get hpa backend-hpa -n civicpulse -w` recorded alongside, with every
+line time-stamped, into `docs/evidence/hpa-watch.txt`; a 5-second sampler
+recorded desired vs ready replicas. The chart is
+`docs/evidence/hpa-scaling-chart.png`.
 
-**Measured lag: ____ seconds** between the offered load rising and replicas
-rising. (Record the wall-clock of the k6 step and of the first replica change in
-the `-w` output, and subtract.)
+**Measured lag: 37 seconds** from the offered load doubling to a new replica
+serving traffic. It splits into two parts that behave very differently:
 
-**Where the time goes.** It is not one delay, it is four stacked:
+| Time | t+ | Event | Source |
+|---|---|---|---|
+| 08:47:00 | 0s | k6 starts, 5 VUs, ~13 req/s | `load/results` |
+| 08:48:05 | 65s | offered load doubles (ramp towards 60 VUs) | k6 per-request log |
+| 08:48:12 | 72s | HPA reads **60%/60% and does nothing** | `hpa-watch.txt` line 12 |
+| 08:48:27 | 87s | HPA reads 75%, above target | `hpa-watch.txt` line 13 |
+| 08:48:29 | 89s | desired replicas 2 → 3: **decision lag 24s** | sampler |
+| 08:48:42 | 102s | 3rd pod Ready and in the Service: **start-up 13s** | sampler |
+| 08:49:13 | 133s | desired 10 = `maxReplicas`; CPU peaks at 353% of request | `hpa-watch.txt` line 16 |
+
+**Where the time went.**
+
+- **24s of it was deciding**, and none of that was Kubernetes being slow. It
+  is the metrics pipeline plus one rule. `hpa-watch.txt` updates every 15
+  seconds, which is metrics-server's resolution, so a load change is invisible
+  until the next reading. Then at 08:48:12 the HPA saw *exactly* 60% and did
+  nothing: it only acts when utilisation exceeds the target by more than its
+  10% tolerance, i.e. above 66%. It acted on the *next* reading, 15 seconds
+  later.
+- **13s of it was starting a pod**: scheduling, container start (no pull —
+  `IfNotPresent` and the image already on the node), and the `startupProbe`
+  and `readinessProbe` passing.
+
+**What happened during the lag.** The two existing pods absorbed the step,
+running at up to 353% of their CPU *request*. They could, because the limit is
+500m (5× the 100m request) — a limit close to the request would have throttled
+them exactly when it mattered. That is why the run had **0.00% failed requests
+and a 47 ms p95** despite the lag (`docs/evidence/hpa-k6-summary.txt`).
+
+**Two findings the run surfaced.**
+
+1. **The HPA hit its ceiling.** It reached `maxReplicas: 10` at t+133s and CPU
+   still sat at 130–170% of request for the whole hold. At 60 VUs, ten pods
+   of 100m is not enough; the 100m request is an underestimate of real use.
+   That is exactly the question the VPA loop (question 6) answers.
+2. **Scale-down waited on purpose.** After the load stopped, replicas stayed
+   at 10 for the whole capture: `scaleDown.stabilizationWindowSeconds: 300`
+   holding capacity rather than flapping.
+
+**Where the time goes in general.** It is not one delay, it is several stacked:
 
 | Stage | Typical | Why |
 |---|---|---|
@@ -183,8 +225,10 @@ the `-w` output, and subtract.)
 | HPA controller sync | ~15s | `--horizontal-pod-autoscaler-sync-period`, default 15s. The decision is only reconsidered each tick. |
 | Pod start | ~10-30s | Scheduling, image pull (fast here: `IfNotPresent` and the image is already on the node), then the `startupProbe` at `failureThreshold: 30, periodSeconds: 2`. |
 
-Roughly 45–75s on a local cluster before new capacity serves its first request.
-Our `behavior.scaleUp.stabilizationWindowSeconds: 0` removes a fifth delay that
+Our measured 37s is the fast end of that range, because the image was already on
+the node. On a real cluster a first pull of the backend image (75 MB compressed)
+adds tens of seconds to every new node's first pod. Our
+`behavior.scaleUp.stabilizationWindowSeconds: 0` removes one more delay that
 would otherwise be added on top.
 
 **What would reduce it.** In rough order of effect for effort:
