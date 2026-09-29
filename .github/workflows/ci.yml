@@ -3,8 +3,11 @@ name: CI
 # On PRs into main and pushes to dev. Never on pushes to main -- by then the
 # checks have already run on the PR, and cd.yml takes over.
 on:
+  # Every PR, not only those into main: rubric I asks for lint, types and
+  # tests "on every PR", and feature branches merge into dev. Without this,
+  # PRs into dev merged with no checks at all.
   pull_request:
-    branches: [main]
+    branches: [main, dev]
   push:
     branches: [dev]
 
