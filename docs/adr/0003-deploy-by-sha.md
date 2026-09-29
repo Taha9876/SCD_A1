@@ -35,11 +35,23 @@ different bytes on Tuesday than it did on Monday, so:
   `kubectl apply` or `kustomize edit set image` line, in `compose.prod.yaml`, or
   in any `image:` / `newTag:` field under `k8s/`.
 
-The bonus step is the digest rather than the tag. A tag is still a mutable
+**Update -- we now deploy by digest, signed (bonus).** A tag is still a mutable
 pointer *at the registry*; a digest is content-addressed and cannot be
-repointed. `cd.yml` already captures `steps.backend.outputs.digest` as a job
-output and prints it to the run summary, so the switch is a one-line change to
-the `kustomize edit set image` argument.
+repointed. `cd.yml` now:
+
+1. signs each image **by digest** with Cosign, keyless: the job's GitHub OIDC
+   token buys a short-lived certificate naming this workflow on this
+   repository (`id-token: write`, on the build job only). There is no signing
+   key to leak, rotate or commit;
+2. in the deploy job, runs `cosign verify` against that exact identity and
+   issuer **before anything is applied** -- an image signed by another
+   workflow, or a fork, is refused;
+3. pins the overlay and the seed Job to `image@sha256:...`, and fails if any
+   application image is still referenced by tag.
+
+The SHA tag is still pushed, because humans read tags; it is just no longer
+what gets deployed. The Argo CD Application pins the same digests
+(`k8s/argocd/application.yaml`). Evidence: `docs/evidence/cd-bonus.md`.
 
 ## Consequences
 

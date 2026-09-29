@@ -33,3 +33,7 @@ git shortlog -sn > docs/evidence/shortlog.txt
 
 `load/k6-script.js` explains how to read the HPA lag off these two captures,
 which is the number `docs/ENGINEERING-NOTES.md` question 5 asks for.
+
+## Bonus: signed digests, zero-downtime rollout, GitOps
+
+See [cd-bonus.md](cd-bonus.md): Cosign keyless sign + verify and deploy by `@sha256` digest; 3,001 requests with 0 failures during a full rolling restart; Argo CD syncing the exact commit and reverting manual drift in 2 s.
