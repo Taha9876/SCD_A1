@@ -23,7 +23,8 @@ submission.
 kubectl get hpa backend-hpa -n civicpulse -w | tee docs/evidence/hpa-watch.txt
 
 # terminal 2
-k6 run --env BASE_URL=http://civicpulse.local:8081 load/k6-script.js
+# HOST_HEADER routes through the Ingress without an /etc/hosts entry
+k6 run --env BASE_URL=http://localhost:8081 --env HOST_HEADER=civicpulse.local load/k6-script.js
 
 # after the run
 kubectl describe vpa backend-vpa -n civicpulse > docs/evidence/vpa-describe.txt
