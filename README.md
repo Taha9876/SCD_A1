@@ -32,6 +32,17 @@ not fall over when the clever one is rate-limited, slow, or simply wrong.
 
 ---
 
+## Observability (bonus)
+
+```bash
+docker compose -f compose.yaml -f compose.observability.yaml up -d --build
+```
+
+- **Grafana** http://localhost:3000: provisioned CivicPulse dashboard (request rate, 5xx ratio, triage fallback ratio, 429s, latency percentiles), fed by Prometheus scraping `backend:8000/metrics`.
+- **Jaeger** http://localhost:16686: OpenTelemetry traces from the browser through the API to the LLM call, one trace per submit.
+
+Tracing is off unless configured (`OTEL_EXPORTER_OTLP_ENDPOINT` on the backend, `OTEL_COLLECTOR_ORIGIN` on the frontend), so tests, CI and the default quickstart are unaffected. Evidence: [docs/evidence](docs/evidence/README.md).
+
 ## Architecture
 
 ```mermaid

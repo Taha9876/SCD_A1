@@ -57,6 +57,13 @@ class Settings(BaseSettings):
     cors_origins: str = Field(default="http://localhost:8080,http://localhost:5173")
     max_page_size: int = 100
 
+    # --- Tracing (bonus) --------------------------------------------------
+    # Empty disables tracing entirely: no exporter, no background thread, no
+    # instrumentation. Set to the collector's OTLP/HTTP base URL, e.g.
+    # http://jaeger:4318 -- a service name, never localhost.
+    otel_exporter_otlp_endpoint: str = ""
+    otel_service_name: str = "civicpulse-backend"
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

@@ -16,6 +16,8 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
+from opentelemetry import trace
+
 from app.config import Settings
 from app.domain.enums import TriagedBy
 from app.providers.cache import Cache
@@ -33,6 +35,10 @@ logger = logging.getLogger("civicpulse.triage")
 #: How many recent outcomes /api/meta/providers reports. Bounded on purpose:
 #: an unbounded observability buffer is a memory leak with good intentions.
 _RECENT_CAPACITY = 20
+
+#: A no-op until app/tracing.py installs a real provider, so this costs nothing
+#: in tests and whenever OTEL_EXPORTER_OTLP_ENDPOINT is unset.
+_tracer = trace.get_tracer("civicpulse.triage")
 
 
 @dataclass(frozen=True)
@@ -105,6 +111,26 @@ class TriageService:
     # -- the work ---------------------------------------------------------
 
     async def triage(self, text: str, location: str) -> TriageOutcome:
+        # One span around the whole decision, so a trace shows the cache
+        # lookup, both attempts and the outbound LLM request as children of a
+        # single step, and records which path actually decided the complaint.
+        with _tracer.start_as_current_span("triage") as span:
+            outcome = await self._triage(text, location)
+            span.set_attributes(
+                {
+                    "triage.provider": self._provider.name,
+                    "triage.triaged_by": outcome.triaged_by.value,
+                    "triage.cache_hit": outcome.cache_hit,
+                    "triage.fallback": outcome.fallback,
+                    "triage.category": outcome.result.category.value,
+                    "triage.latency_ms": outcome.latency_ms,
+                }
+            )
+            if outcome.error_class:
+                span.set_attribute("triage.error_class", outcome.error_class)
+            return outcome
+
+    async def _triage(self, text: str, location: str) -> TriageOutcome:
         digest = content_hash(text, location)
         started = time.perf_counter()
 

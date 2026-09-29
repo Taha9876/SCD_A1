@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: civicpulse
+    folder: CivicPulse
+    type: file
+    # Dashboards are code: edited in git, reviewed in a PR, not in the UI.
+    allowUiUpdates: false
+    disableDeletion: true
+    options:
+      path: /var/lib/grafana/dashboards

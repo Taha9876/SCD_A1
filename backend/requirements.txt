@@ -13,3 +13,9 @@ asyncpg==0.30.0
 alembic==1.14.0
 redis==5.2.1
 httpx==0.28.1
+# Tracing (bonus). Inert unless OTEL_EXPORTER_OTLP_ENDPOINT is set.
+opentelemetry-api==1.45.0
+opentelemetry-sdk==1.45.0
+opentelemetry-exporter-otlp-proto-http==1.45.0
+opentelemetry-instrumentation-fastapi==0.66b0
+opentelemetry-instrumentation-httpx==0.66b0
