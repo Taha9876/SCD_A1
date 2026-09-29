@@ -34,6 +34,7 @@ git shortlog -sn > docs/evidence/shortlog.txt
 `load/k6-script.js` explains how to read the HPA lag off these two captures,
 which is the number `docs/ENGINEERING-NOTES.md` question 5 asks for.
 
+ feat/observability
 ## Bonus: Prometheus + Grafana, and OpenTelemetry tracing
 
 Run with `docker compose -f compose.yaml -f compose.observability.yaml up -d --build`.
@@ -44,3 +45,8 @@ Run with `docker compose -f compose.yaml -f compose.observability.yaml up -d --b
 | `otel-trace-frontend-backend-llm.png` | One trace from a real submit in the browser: `civicpulse-frontend POST` → `civicpulse-backend POST /api/complaints` → `triage` → `POST https://api.groq.com/openai/v1/chat/completions` (200, 638 ms). Depth 4, 2 services. The browser exports spans same-origin via nginx `/otel/v1/traces` (POST only); the backend exports to `jaeger:4318`. |
 
 Tests: `backend/tests/test_tracing.py` asserts the server span, triage span and LLM client span all share the browser's trace id and nest correctly; `frontend/tests/Tracing.test.ts` asserts `traceparent` is added to same-origin API calls and not to third-party origins.
+=======
+## Bonus: signed digests, zero-downtime rollout, GitOps
+
+See [cd-bonus.md](cd-bonus.md): Cosign keyless sign + verify and deploy by `@sha256` digest; 3,001 requests with 0 failures during a full rolling restart; Argo CD syncing the exact commit and reverting manual drift in 2 s.
+ dev

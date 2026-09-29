@@ -1,0 +1,62 @@
+# Argo CD Application (bonus: GitOps).
+#
+# The cluster's desired state is this repository: Argo CD watches
+# k8s/overlays/gitops on main and continuously reconciles the civicpulse
+# namespace to it. Nobody runs `kubectl apply` against a GitOps-managed
+# cluster -- a change is a commit, reviewed in a PR, and a rollback is a revert.
+#
+#   automated.prune     objects deleted from git are deleted from the cluster
+#   automated.selfHeal  manual drift (kubectl scale/edit/delete) is reverted
+#
+# Image references. The overlay keeps its placeholder tags (see
+# overlays/prod/kustomization.yaml), and the release pins them HERE, in
+# spec.source.kustomize.images, by DIGEST. cd.yml's gitops job fills them in
+# from the images it has just built and Cosign-verified, and pins
+# targetRevision to the same commit. In a long-lived cluster that write-back
+# is done by a commit to this file (or by Argo CD Image Updater), so the
+# running digest is always recorded in git -- which is the point of GitOps.
+#
+# The Secret is not in git and never will be: cd.yml creates it from GitHub
+# Secrets before the first sync, and the overlay does not manage it, so Argo
+# neither overwrites nor prunes it.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: civicpulse
+  namespace: argocd
+  # Deleting the Application deletes what it deployed, instead of orphaning it.
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/i222641-byte/SCD_A1.git
+    targetRevision: main
+    path: k8s/overlays/gitops
+    kustomize:
+      images: []
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: civicpulse
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      # Fail loudly on a field Argo would otherwise silently drop.
+      - Validate=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 10s
+        factor: 2
+        maxDuration: 2m
+  # HPA owns the backend's replica count once it exists. Without this, Argo
+  # would "heal" every autoscaling decision back to the manifest's replicas.
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      name: backend
+      jsonPointers:
+        - /spec/replicas

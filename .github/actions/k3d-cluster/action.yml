@@ -1,0 +1,65 @@
+name: k3d cluster with the CivicPulse platform add-ons
+description: >
+  An ephemeral k3d cluster with ingress-nginx, metrics-server and the VPA
+  recommender -- everything the manifests assume exists. Shared by cd.yml's
+  imperative deploy job and its GitOps job, so both test against the same
+  platform and a version bump happens in one place.
+
+runs:
+  using: composite
+  steps:
+    - name: Install k3d, kubectl and kustomize
+      shell: bash
+      run: |
+        curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG=v5.7.4 bash
+        curl -sSLO "https://dl.k8s.io/release/v1.31.3/bin/linux/amd64/kubectl"
+        chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+        curl -sSL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+        sudo mv kustomize /usr/local/bin/
+
+    - name: Create the cluster
+      shell: bash
+      run: |
+        k3d cluster create civicpulse \
+          --agents 1 \
+          --port "8081:80@loadbalancer" \
+          --k3s-arg "--disable=traefik@server:0" \
+          --wait
+        kubectl cluster-info
+
+    - name: Install ingress-nginx
+      # rollout status, not `kubectl wait --for=condition=ready pod`: the
+      # Deployment exists the moment apply returns, its pods do not, and
+      # `wait` on a selector matching nothing fails at once with "no matching
+      # resources found" instead of waiting. The first CD run died on exactly
+      # that race.
+      shell: bash
+      run: |
+        kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.12.0/deploy/static/provider/cloud/deploy.yaml
+        kubectl -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout=180s
+        # The admission webhook must be serving before any Ingress is applied,
+        # or the apply is rejected with "failed calling webhook".
+        kubectl -n ingress-nginx wait --for=condition=complete job/ingress-nginx-admission-patch --timeout=120s
+
+    - name: Install metrics-server
+      # Required for the HPA. --kubelet-insecure-tls because k3d's kubelet
+      # serving certificate is self-signed; fine for an ephemeral cluster,
+      # never on a real one.
+      shell: bash
+      run: |
+        kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml
+        kubectl patch -n kube-system deployment metrics-server --type=json \
+          -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+        kubectl -n kube-system rollout status deployment/metrics-server --timeout=180s
+
+    - name: Install the VPA recommender
+      # The prod overlay contains a VerticalPodAutoscaler; without its CRD,
+      # `kubectl apply` fails with "no matches for kind". Recommender only:
+      # updateMode Off needs neither the updater nor the admission webhook.
+      shell: bash
+      run: |
+        base=https://raw.githubusercontent.com/kubernetes/autoscaler/vertical-pod-autoscaler-1.2.1/vertical-pod-autoscaler/deploy
+        for f in vpa-v1-crd-gen.yaml vpa-rbac.yaml recommender-deployment.yaml; do
+          kubectl apply -f "$base/$f"
+        done
+        kubectl -n kube-system rollout status deployment/vpa-recommender --timeout=180s
