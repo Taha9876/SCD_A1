@@ -1,7 +1,9 @@
 name: CI
 
-# On PRs into main and pushes to dev. Never on pushes to main -- by then the
-# checks have already run on the PR, and cd.yml takes over.
+# On every PR, and on pushes to dev and main. The push to main re-runs the
+# checks on the merge commit itself: that is what the README's CI badge
+# (?branch=main) reports, and without it the badge had no run to show and
+# read "no status". cd.yml also re-tests main before it publishes anything.
 on:
   # Every PR, not only those into main: rubric I asks for lint, types and
   # tests "on every PR", and feature branches merge into dev. Without this,
@@ -9,7 +11,7 @@ on:
   pull_request:
     branches: [main, dev]
   push:
-    branches: [dev]
+    branches: [dev, main]
 
 # Least privilege. The default token can write to the repository; nothing in
 # this workflow needs to, so nothing here can.
