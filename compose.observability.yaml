@@ -1,0 +1,127 @@
+# CivicPulse -- observability overlay (bonus).
+#
+#   docker compose -f compose.yaml -f compose.observability.yaml up -d --build
+#
+# Adds, on top of the normal stack:
+#
+#   prometheus  scrapes backend:8000/metrics every 5s     (internal only)
+#   grafana     the CivicPulse dashboard, provisioned     http://localhost:3000
+#   jaeger      OpenTelemetry traces, browser -> API -> LLM  http://localhost:16686
+#
+# An overlay rather than a profile, because tracing also has to be switched on
+# in two EXISTING services (backend, frontend), and a profile can only add
+# services. Without this file nothing here runs and nothing is exported.
+#
+# Network placement follows the same rule as the base file -- nothing gets a
+# route it does not need:
+#   * prometheus is internal-only: it talks to the backend and to grafana.
+#   * grafana and jaeger join edge as well, only so their UIs can be published.
+#   * the frontend reaches jaeger:4318 over edge for the /otel proxy, and still
+#     has no route to the database or the cache.
+
+services:
+  backend:
+    environment:
+      # A service name, never localhost (see compose.yaml).
+      OTEL_EXPORTER_OTLP_ENDPOINT: "http://jaeger:4318"
+      OTEL_SERVICE_NAME: "civicpulse-backend"
+    depends_on:
+      jaeger:
+        condition: service_started
+
+  frontend:
+    environment:
+      # nginx proxies same-origin /otel/v1/traces here; the browser never
+      # learns the collector's address and its port is never published.
+      OTEL_COLLECTOR_ORIGIN: "http://jaeger:4318"
+    depends_on:
+      # nginx resolves proxy_pass hosts at startup and refuses to start if one
+      # does not resolve, and Docker DNS only answers for running containers.
+      jaeger:
+        condition: service_started
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      # A demo stack, not an archive: two days is plenty to show a load test.
+      - --storage.tsdb.retention.time=2d
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - internal
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://localhost:9090/-/ready"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+
+  grafana:
+    image: grafana/grafana:13.2.3
+    restart: unless-stopped
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      # Read-only anonymous access to a LOCAL demo dashboard, so no password
+      # ever has to be written into this file. Nobody can edit anything
+      # without logging in as the admin, whose password is Grafana's own
+      # first-run prompt rather than a value committed here.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: "/var/lib/grafana/dashboards/civicpulse.json"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - edge
+      - internal
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--spider", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          # 512M, measured: at 256M Grafana 13 sat at 253 MiB while rendering
+          # this dashboard and was restarted mid-render.
+          memory: 512M
+
+  jaeger:
+    image: jaegertracing/jaeger:2.21.0
+    restart: unless-stopped
+    environment:
+      # Jaeger v2 binds every receiver to localhost by default, which inside a
+      # container means "unreachable from every other container".
+      JAEGER_LISTEN_HOST: "0.0.0.0"
+    ports:
+      # The UI only. OTLP (4317/4318) stays unpublished: spans arrive over the
+      # compose networks, from the backend directly and from the browser via
+      # the frontend's /otel proxy.
+      - "${JAEGER_UI_PORT:-16686}:16686"
+    networks:
+      - edge
+      - internal
+    deploy:
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 512M

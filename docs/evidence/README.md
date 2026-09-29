@@ -33,3 +33,14 @@ git shortlog -sn > docs/evidence/shortlog.txt
 
 `load/k6-script.js` explains how to read the HPA lag off these two captures,
 which is the number `docs/ENGINEERING-NOTES.md` question 5 asks for.
+
+## Bonus: Prometheus + Grafana, and OpenTelemetry tracing
+
+Run with `docker compose -f compose.yaml -f compose.observability.yaml up -d --build`.
+
+| file | what it shows |
+|---|---|
+| `grafana-dashboard.png` | The provisioned dashboard (`observability/grafana/dashboards/civicpulse.json`) during a mixed load: requests by route, 2xx/4xx split, latency p50/p95/p99, Groq triage p95, 0.00% 5xx, 0% fallback, and the Redis rate limiter's 429s. Prometheus scrapes `backend:8000/metrics` every 5s over the internal network. |
+| `otel-trace-frontend-backend-llm.png` | One trace from a real submit in the browser: `civicpulse-frontend POST` → `civicpulse-backend POST /api/complaints` → `triage` → `POST https://api.groq.com/openai/v1/chat/completions` (200, 638 ms). Depth 4, 2 services. The browser exports spans same-origin via nginx `/otel/v1/traces` (POST only); the backend exports to `jaeger:4318`. |
+
+Tests: `backend/tests/test_tracing.py` asserts the server span, triage span and LLM client span all share the browser's trace id and nest correctly; `frontend/tests/Tracing.test.ts` asserts `traceparent` is added to same-origin API calls and not to third-party origins.

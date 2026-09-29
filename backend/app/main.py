@@ -22,6 +22,7 @@ from app.providers.cache import RedisCache
 from app.providers.triage.factory import build_provider
 from app.routes import complaints, health, meta, stats
 from app.services.triage_service import TriageService
+from app.tracing import configure_tracing
 
 logger = logging.getLogger("civicpulse.app")
 
@@ -92,7 +93,9 @@ def create_app() -> FastAPI:
         allow_origins=settings.cors_origin_list,
         allow_credentials=False,
         allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
-        allow_headers=["Content-Type", "X-Request-ID"],
+        # traceparent/tracestate: the browser's trace context (bonus tracing),
+        # needed only when API_BASE_URL makes the API cross-origin.
+        allow_headers=["Content-Type", "X-Request-ID", "traceparent", "tracestate"],
         expose_headers=["X-Cache", "X-Request-ID", "Retry-After",
                         "X-RateLimit-Limit", "X-RateLimit-Remaining"],
     )
@@ -104,6 +107,7 @@ def create_app() -> FastAPI:
     app.include_router(health.router)
 
     _install_error_handlers(app)
+    configure_tracing(app, settings)
     return app
 
 

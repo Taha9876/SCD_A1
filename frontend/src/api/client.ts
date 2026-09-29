@@ -28,7 +28,7 @@ import type {
 
 declare global {
   interface Window {
-    __CIVICPULSE_CONFIG__?: { apiBaseUrl?: string }
+    __CIVICPULSE_CONFIG__?: { apiBaseUrl?: string; otelExporterUrl?: string }
   }
 }
 
