@@ -207,6 +207,17 @@ jobs:
             -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
           kubectl -n kube-system rollout status deployment/metrics-server --timeout=180s
 
+      - name: Install the VPA recommender
+        # The prod overlay contains a VerticalPodAutoscaler; without its CRD,
+        # `kubectl apply` fails with "no matches for kind". Recommender only:
+        # updateMode Off needs neither the updater nor the admission webhook.
+        run: |
+          base=https://raw.githubusercontent.com/kubernetes/autoscaler/vertical-pod-autoscaler-1.2.1/vertical-pod-autoscaler/deploy
+          for f in vpa-v1-crd-gen.yaml vpa-rbac.yaml recommender-deployment.yaml; do
+            kubectl apply -f "$base/$f"
+          done
+          kubectl -n kube-system rollout status deployment/vpa-recommender --timeout=180s
+
       - name: Lowercase the repository name
         id: repo
         run: echo "name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
@@ -253,6 +264,9 @@ jobs:
         # rather than relying on CrashLoopBackOff-and-retry.
         run: |
           kustomize build k8s/overlays/prod > /tmp/prod.yaml
+          # Configuration first: Postgres reads it through configMapKeyRef and
+          # would otherwise sit in CreateContainerConfigError.
+          kubectl apply -f /tmp/prod.yaml --selector app.kubernetes.io/component=config
           kubectl apply -f /tmp/prod.yaml --selector app.kubernetes.io/component=database
           kubectl apply -f /tmp/prod.yaml --selector app.kubernetes.io/component=cache
           kubectl -n civicpulse rollout status statefulset/postgres --timeout=240s
@@ -275,8 +289,12 @@ jobs:
           kubectl -n civicpulse rollout status deployment/frontend --timeout=180s
 
       - name: Seed demo data
+        # seed-job.yaml is not in the kustomization (production does not seed),
+        # so `kustomize edit set image` never reaches it. Pin its image to this
+        # commit's SHA here, or the pod tries to pull the literal placeholder.
         run: |
-          kubectl apply -f k8s/base/seed-job.yaml
+          sed "s#ghcr.io/OWNER/REPO/civicpulse-backend:PLACEHOLDER#${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/civicpulse-backend:${{ github.sha }}#" \
+            k8s/base/seed-job.yaml | kubectl apply -f -
           kubectl -n civicpulse wait --for=condition=complete job/civicpulse-seed --timeout=180s \
             || { kubectl -n civicpulse logs job/civicpulse-seed; exit 1; }
 
