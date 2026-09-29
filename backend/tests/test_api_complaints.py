@@ -7,7 +7,7 @@ import pytest
 async def test_submit_returns_201_with_triage_fields(client, valid_complaint):
     response = await client.post("/api/complaints", json=valid_complaint)
 
-    assert response.status_code == 201
+    assert response.status_code == 200  # deliberately wrong: proves the CI gate blocks a merge
     body = response.json()
     assert body["category"] == "water"
     assert body["priority"] == "high"  # "flooding" + "entering ground floors"
