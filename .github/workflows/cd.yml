@@ -87,6 +87,10 @@ jobs:
       # GITHUB_TOKEN with packages: write -- scoped to this job, expires with
       # the run, revocable. Never an account password, never a long-lived PAT.
       packages: write
+      # Keyless Cosign: the job's short-lived OIDC identity token is exchanged
+      # for a signing certificate bound to THIS workflow on THIS repository.
+      # No signing key exists anywhere to leak, rotate or commit.
+      id-token: write
     outputs:
       backend-digest: ${{ steps.backend.outputs.digest }}
       frontend-digest: ${{ steps.frontend.outputs.digest }}
@@ -139,6 +143,20 @@ jobs:
           provenance: true
           sbom: true
 
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Sign both images by digest (keyless)
+        # Sign the DIGEST, never a tag: a tag can be repointed after signing,
+        # a digest cannot. The signature and its certificate go to the
+        # registry beside the image and to the public Rekor transparency log.
+        env:
+          BACKEND: ${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/civicpulse-backend@${{ steps.backend.outputs.digest }}
+          FRONTEND: ${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/civicpulse-frontend@${{ steps.frontend.outputs.digest }}
+        run: |
+          cosign sign --yes "$BACKEND"
+          cosign sign --yes "$FRONTEND"
+
       - name: Generate SBOMs with Syft
         uses: anchore/sbom-action@v0
         with:
@@ -172,56 +190,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install k3d, kubectl and kustomize
-        run: |
-          curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | TAG=v5.7.4 bash
-          curl -sSLO "https://dl.k8s.io/release/v1.31.3/bin/linux/amd64/kubectl"
-          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
-          curl -sSL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
-          sudo mv kustomize /usr/local/bin/
-
-      - name: Create the cluster
-        run: |
-          k3d cluster create civicpulse \
-            --agents 1 \
-            --port "8081:80@loadbalancer" \
-            --k3s-arg "--disable=traefik@server:0" \
-            --wait
-          kubectl cluster-info
-
-      - name: Install ingress-nginx
-        # rollout status, not `kubectl wait --for=condition=ready pod`: the
-        # Deployment exists the moment apply returns, its pods do not, and
-        # `wait` on a selector matching nothing fails at once with "no matching
-        # resources found" instead of waiting. The first CD run died on exactly
-        # that race.
-        run: |
-          kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/controller-v1.12.0/deploy/static/provider/cloud/deploy.yaml
-          kubectl -n ingress-nginx rollout status deployment/ingress-nginx-controller --timeout=180s
-          # The admission webhook must be serving before any Ingress is applied,
-          # or the apply is rejected with "failed calling webhook".
-          kubectl -n ingress-nginx wait --for=condition=complete job/ingress-nginx-admission-patch --timeout=120s
-
-      - name: Install metrics-server
-        # Required for the HPA. --kubelet-insecure-tls because k3d's kubelet
-        # serving certificate is self-signed; fine for an ephemeral cluster,
-        # never on a real one.
-        run: |
-          kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/download/v0.7.2/components.yaml
-          kubectl patch -n kube-system deployment metrics-server --type=json \
-            -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
-          kubectl -n kube-system rollout status deployment/metrics-server --timeout=180s
-
-      - name: Install the VPA recommender
-        # The prod overlay contains a VerticalPodAutoscaler; without its CRD,
-        # `kubectl apply` fails with "no matches for kind". Recommender only:
-        # updateMode Off needs neither the updater nor the admission webhook.
-        run: |
-          base=https://raw.githubusercontent.com/kubernetes/autoscaler/vertical-pod-autoscaler-1.2.1/vertical-pod-autoscaler/deploy
-          for f in vpa-v1-crd-gen.yaml vpa-rbac.yaml recommender-deployment.yaml; do
-            kubectl apply -f "$base/$f"
-          done
-          kubectl -n kube-system rollout status deployment/vpa-recommender --timeout=180s
+      - name: Create the cluster and install the platform add-ons
+        uses: ./.github/actions/k3d-cluster
 
       - name: Lowercase the repository name
         id: repo
@@ -250,18 +220,51 @@ jobs:
           kubectl patch serviceaccount default -n civicpulse \
             -p '{"imagePullSecrets":[{"name":"ghcr-pull"}]}'
 
-      - name: Pin the overlay to this commit SHA
-        # Deploy by immutable reference. `kustomize edit set image` rewrites the
-        # overlay in the runner's checkout -- it is never committed, so the
-        # repository keeps its placeholder and the deploy is reproducible from
-        # the SHA alone.
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Log in to GHCR (to read signatures)
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify both signatures before deploying anything
+        # Refuse to deploy an image this exact workflow did not sign. The
+        # identity check is what makes it mean something: a valid signature
+        # from someone else's workflow -- or a fork's -- fails here.
+        env:
+          IDENTITY: https://github.com/${{ github.workflow_ref }}
+          BACKEND: ${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/civicpulse-backend@${{ needs.build-push.outputs.backend-digest }}
+          FRONTEND: ${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/civicpulse-frontend@${{ needs.build-push.outputs.frontend-digest }}
+        run: |
+          for image in "$BACKEND" "$FRONTEND"; do
+            echo "== $image"
+            cosign verify "$image" \
+              --certificate-identity "$IDENTITY" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --output text > verify.out
+            head -n 5 verify.out
+          done
+
+      - name: Pin the overlay to the verified DIGESTS
+        # Deploy by digest, not by tag (bonus). The SHA tag is immutable by
+        # convention; the digest is immutable by construction -- it IS the
+        # content hash, so the bytes the kubelet pulls are exactly the bytes
+        # that were tested, signed and verified above. `kustomize edit` changes
+        # the runner's checkout only; nothing is committed.
         working-directory: k8s/overlays/prod
         run: |
           kustomize edit set image \
-            ghcr.io/OWNER/REPO/civicpulse-backend=${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/civicpulse-backend:${{ github.sha }}
+            ghcr.io/OWNER/REPO/civicpulse-backend=${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/civicpulse-backend@${{ needs.build-push.outputs.backend-digest }}
           kustomize edit set image \
-            ghcr.io/OWNER/REPO/civicpulse-frontend=${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/civicpulse-frontend:${{ github.sha }}
+            ghcr.io/OWNER/REPO/civicpulse-frontend=${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/civicpulse-frontend@${{ needs.build-push.outputs.frontend-digest }}
           kustomize build . | grep 'image:'
+          # Fail rather than silently fall back to a tag.
+          if kustomize build . | grep -E 'image: .*civicpulse-(backend|frontend):'; then
+            echo "::error::an application image is still referenced by tag"; exit 1
+          fi
 
       - name: Apply the data layer first
         # Postgres and Redis must be ready before the migration Job, and the
@@ -295,10 +298,10 @@ jobs:
 
       - name: Seed demo data
         # seed-job.yaml is not in the kustomization (production does not seed),
-        # so `kustomize edit set image` never reaches it. Pin its image to this
-        # commit's SHA here, or the pod tries to pull the literal placeholder.
+        # so `kustomize edit set image` never reaches it. Pin its image to the
+        # same verified digest here, or the pod pulls the literal placeholder.
         run: |
-          sed "s#ghcr.io/OWNER/REPO/civicpulse-backend:PLACEHOLDER#${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/civicpulse-backend:${{ github.sha }}#" \
+          sed "s#ghcr.io/OWNER/REPO/civicpulse-backend:PLACEHOLDER#${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/civicpulse-backend@${{ needs.build-push.outputs.backend-digest }}#" \
             k8s/base/seed-job.yaml | kubectl apply -f -
           kubectl -n civicpulse wait --for=condition=complete job/civicpulse-seed --timeout=180s \
             || { kubectl -n civicpulse logs job/civicpulse-seed; exit 1; }
@@ -325,6 +328,45 @@ jobs:
             -H 'Content-Type: application/json' \
             -d '{"text":"Smoke test: transformer sparking over the footpath here.","location":"CI runner, ephemeral cluster"}' \
             http://localhost:8081/api/complaints | python -m json.tool
+
+      - name: Install k6
+        uses: grafana/setup-k6-action@v1.2.2
+
+      - name: Zero-downtime rolling update under live load
+        # Bonus: every backend AND frontend pod is replaced while k6 offers a
+        # constant 20 req/s through the Ingress. load/k6-rolling.js fails the
+        # run on a single failed request (http_req_failed rate==0).
+        run: |
+          BASE_URL=http://localhost:8081 HOST_HEADER=civicpulse.local \
+            k6 run --summary-export=rolling-summary.json load/k6-rolling.js > k6-rolling.log 2>&1 &
+          k6_pid=$!
+
+          sleep 20   # a baseline under load before anything changes
+          kubectl -n civicpulse rollout restart deployment/backend deployment/frontend
+          kubectl -n civicpulse rollout status deployment/backend  --timeout=240s
+          kubectl -n civicpulse rollout status deployment/frontend --timeout=240s
+          echo "rollout finished at $(date -u +%T)"
+
+          # The claim only holds if load covered the WHOLE rollout.
+          if ! kill -0 "$k6_pid" 2>/dev/null; then
+            echo "::error::k6 finished before the rollout did"; cat k6-rolling.log; exit 1
+          fi
+
+          set +e; wait "$k6_pid"; k6_status=$?; set -e
+          cat k6-rolling.log
+          python3 scripts/rolling_summary.py rolling-summary.json | tee -a "$GITHUB_STEP_SUMMARY"
+          kubectl -n civicpulse get rs -l app.kubernetes.io/part-of=civicpulse
+          exit "$k6_status"
+
+      - name: Upload the rolling-update evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zero-downtime-rollout
+          path: |
+            k6-rolling.log
+            rolling-summary.json
+          if-no-files-found: ignore
 
       - name: Verify Postgres survives losing its pod
         # The persistence claim, tested rather than asserted.
@@ -370,6 +412,155 @@ jobs:
           kubectl -n civicpulse describe pods
           kubectl -n civicpulse logs -l app.kubernetes.io/name=backend --tail=100 --all-containers || true
           kubectl -n civicpulse get events --sort-by=.lastTimestamp | tail -40
+
+      - name: Delete the cluster
+        if: always()
+        run: k3d cluster delete civicpulse
+
+  # ---------------------------------------------------------------------------
+  # 4. GitOps (bonus): Argo CD reconciles a second ephemeral cluster from the
+  #    repository. No `kubectl apply` of the application here -- the only
+  #    thing applied is the Argo CD Application, which names a git path and a
+  #    commit. Then drift is introduced by hand and Argo is made to undo it.
+  # ---------------------------------------------------------------------------
+  gitops:
+    name: GitOps sync with Argo CD
+    needs: build-push
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    env:
+      ARGOCD_VERSION: v3.5.3
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create the cluster and install the platform add-ons
+        uses: ./.github/actions/k3d-cluster
+
+      - name: Lowercase the repository name
+        id: repo
+        run: echo "name=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Argo CD
+        # --server-side: the ApplicationSet CRD is larger than the 256 KB
+        # last-applied annotation a client-side apply would try to write.
+        run: |
+          kubectl create namespace argocd
+          kubectl apply -n argocd --server-side --force-conflicts \
+            -f "https://raw.githubusercontent.com/argoproj/argo-cd/${ARGOCD_VERSION}/manifests/install.yaml"
+          kubectl -n argocd rollout status statefulset/argocd-application-controller --timeout=300s
+          kubectl -n argocd rollout status deployment/argocd-repo-server --timeout=300s
+          kubectl -n argocd rollout status deployment/argocd-server --timeout=300s
+
+      - name: Create what git must never hold (out of band)
+        # The Secret comes from GitHub Secrets, as in the deploy job. The
+        # overlay does not manage it, so Argo neither overwrites nor prunes it.
+        run: |
+          kubectl create namespace civicpulse
+          kubectl create secret generic civicpulse-secrets \
+            --namespace civicpulse \
+            --from-literal=POSTGRES_PASSWORD="${{ secrets.POSTGRES_PASSWORD }}" \
+            --from-literal=LLM_API_KEY="${{ secrets.LLM_API_KEY }}"
+          kubectl create secret docker-registry ghcr-pull \
+            --namespace civicpulse \
+            --docker-server=${{ env.REGISTRY }} \
+            --docker-username=${{ github.actor }} \
+            --docker-password=${{ secrets.GITHUB_TOKEN }}
+          kubectl patch serviceaccount default -n civicpulse \
+            -p '{"imagePullSecrets":[{"name":"ghcr-pull"}]}'
+
+      - name: Point the Application at this commit and the signed digests
+        # The release pins the commit and the digests in the Application
+        # itself; see the header of k8s/argocd/application.yaml.
+        env:
+          REPO_URL: https://github.com/${{ github.repository }}.git
+          BACKEND: ghcr.io/OWNER/REPO/civicpulse-backend=${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/civicpulse-backend@${{ needs.build-push.outputs.backend-digest }}
+          FRONTEND: ghcr.io/OWNER/REPO/civicpulse-frontend=${{ env.REGISTRY }}/${{ steps.repo.outputs.name }}/civicpulse-frontend@${{ needs.build-push.outputs.frontend-digest }}
+        run: |
+          yq -i '
+            .spec.source.repoURL = strenv(REPO_URL) |
+            .spec.source.targetRevision = strenv(GITHUB_SHA) |
+            .spec.source.kustomize.images = [strenv(BACKEND), strenv(FRONTEND)]
+          ' k8s/argocd/application.yaml
+          yq '.spec.source' k8s/argocd/application.yaml
+          kubectl apply -f k8s/argocd/application.yaml
+
+      - name: Wait for Argo CD to report Synced and Healthy
+        run: |
+          for attempt in $(seq 1 72); do
+            sync=$(kubectl -n argocd get application civicpulse -o jsonpath='{.status.sync.status}')
+            health=$(kubectl -n argocd get application civicpulse -o jsonpath='{.status.health.status}')
+            echo "$(date -u +%T) sync=${sync:-?} health=${health:-?}"
+            if [ "$sync" = Synced ] && [ "$health" = Healthy ]; then break; fi
+            sleep 10
+          done
+          test "$sync" = Synced && test "$health" = Healthy
+          revision=$(kubectl -n argocd get application civicpulse -o jsonpath='{.status.sync.revision}')
+          echo "synced revision: $revision"
+          test "$revision" = "$GITHUB_SHA" || { echo "::error::Argo synced $revision, expected $GITHUB_SHA"; exit 1; }
+          kubectl -n argocd get application civicpulse \
+            -o jsonpath='{range .status.resources[*]}{.kind}{"/"}{.name}{"  "}{.status}{"  "}{.health.status}{"\n"}{end}'
+
+      - name: Smoke test what Argo deployed, through the Ingress
+        run: |
+          for attempt in $(seq 1 60); do
+            curl -fsS -H 'Host: civicpulse.local' http://localhost:8081/api/stats > stats.json 2>/dev/null && break
+            sleep 2
+          done
+          cat stats.json; echo
+          curl -fsS -H 'Host: civicpulse.local' http://localhost:8081/ | grep -q CivicPulse
+          kubectl -n civicpulse get deploy,sts -o wide
+
+      - name: Self-heal -- manual drift is reverted from git
+        # The GitOps property itself: the cluster converges on the repository,
+        # not on whoever last ran kubectl.
+        run: |
+          want=$(kustomize build k8s/overlays/gitops \
+            | yq 'select(.kind == "Deployment" and .metadata.name == "frontend") | .spec.replicas')
+          echo "frontend replicas in git: $want"
+
+          echo "--- drift 1: scale the frontend by hand to 5"
+          kubectl -n civicpulse scale deployment/frontend --replicas=5
+          for attempt in $(seq 1 45); do
+            now=$(kubectl -n civicpulse get deployment frontend -o jsonpath='{.spec.replicas}')
+            echo "$(date -u +%T) spec.replicas=$now"
+            [ "$now" = "$want" ] && break
+            sleep 2
+          done
+          test "$now" = "$want"
+
+          echo "--- drift 2: delete the frontend Service"
+          kubectl -n civicpulse delete service frontend
+          for attempt in $(seq 1 45); do
+            kubectl -n civicpulse get service frontend >/dev/null 2>&1 && break
+            sleep 2
+          done
+          kubectl -n civicpulse get service frontend
+          curl -fsS -H 'Host: civicpulse.local' http://localhost:8081/ | grep -q CivicPulse
+          echo "both drifts reverted by Argo CD"
+
+      - name: GitOps summary
+        if: always()
+        run: |
+          {
+            echo "### GitOps (Argo CD ${ARGOCD_VERSION})"
+            echo ""
+            echo '```'
+            kubectl -n argocd get application civicpulse -o wide 2>&1 || true
+            echo ""
+            kubectl -n argocd get application civicpulse \
+              -o jsonpath='{range .status.history[*]}{.revision}{"  deployed "}{.deployedAt}{"\n"}{end}' 2>&1 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          kubectl -n argocd get application civicpulse -o yaml | tail -80 || true
+          kubectl -n civicpulse get all || true
+          kubectl -n civicpulse get events --sort-by=.lastTimestamp | tail -40 || true
+          kubectl -n argocd logs statefulset/argocd-application-controller --tail=60 || true
 
       - name: Delete the cluster
         if: always()
