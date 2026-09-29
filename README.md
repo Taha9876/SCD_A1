@@ -40,7 +40,7 @@ graph TB
     operator([Operator])
 
     subgraph edge["edge network"]
-        FE["<b>frontend</b><br/>React 18 + Vite + TS<br/>nginx:1.27-alpine<br/>proxies /api"]
+        FE["<b>frontend</b><br/>React 18 + Vite + TS<br/>nginx:1.30-alpine<br/>proxies /api"]
         BE["<b>backend</b><br/>FastAPI + Pydantic v2<br/>routes / services /<br/>repositories / providers"]
     end
 

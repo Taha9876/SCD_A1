@@ -475,7 +475,7 @@ figure comes from Docker 29's containerd store and counts the compressed blobs
 
 | Image | Final stage | Of which ours | Compressed (as pushed to GHCR) |
 |---|---|---|---|
-| `civicpulse-frontend` | **53.2 MB** | 0.6 MB on top of `nginx:1.27-alpine` (52.6 MB) | 21.0 MB |
+| `civicpulse-frontend` | **53.2 MB** | 0.6 MB on top of `nginx:1.27-alpine` (52.6 MB; measured before the move to 1.30, see the Dockerfile) | 21.0 MB |
 | `civicpulse-backend` | 248.0 MB | venv + app on top of `python:3.12-slim-bookworm` | 75.3 MB |
 
 The frontend clears the spec's ~60 MB bar, which is the evidence that the
