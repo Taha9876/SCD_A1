@@ -44,6 +44,10 @@ metadata:
   namespace: civicpulse
   labels:
     app.kubernetes.io/name: postgres
+    # So the deploy's data-layer step (-l component=database) creates it with
+    # the StatefulSet. Without it, the migrate Job ran before this Service
+    # existed and failed to resolve postgres-client.
+    app.kubernetes.io/component: database
 spec:
   type: ClusterIP
   selector:

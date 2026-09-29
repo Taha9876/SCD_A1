@@ -27,6 +27,9 @@ metadata:
   namespace: civicpulse
   labels:
     app.kubernetes.io/name: redis
+    # Applied with the Deployment by -l component=cache; without it the Redis
+    # pod waits Pending for a claim that does not exist yet.
+    app.kubernetes.io/component: cache
 spec:
   accessModes: ["ReadWriteOnce"]
   resources:

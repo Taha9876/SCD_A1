@@ -3,8 +3,11 @@ name: CI
 # On PRs into main and pushes to dev. Never on pushes to main -- by then the
 # checks have already run on the PR, and cd.yml takes over.
 on:
+  # Every PR, not only those into main: rubric I asks for lint, types and
+  # tests "on every PR", and feature branches merge into dev. Without this,
+  # PRs into dev merged with no checks at all.
   pull_request:
-    branches: [main]
+    branches: [main, dev]
   push:
     branches: [dev]
 
@@ -220,7 +223,7 @@ jobs:
           docker load -i /tmp/frontend.tar
 
       - name: Scan backend
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: civicpulse-backend:ci
           format: table
@@ -232,7 +235,7 @@ jobs:
           ignore-unfixed: true
 
       - name: Scan frontend
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: civicpulse-frontend:ci
           format: table

@@ -5,6 +5,12 @@ kind: ConfigMap
 metadata:
   name: civicpulse-config
   namespace: civicpulse
+  labels:
+    # Lets a deploy apply configuration before anything that reads it:
+    # `kubectl apply -l app.kubernetes.io/component=config`. Without that
+    # ordering the Postgres pod starts first and sits in
+    # CreateContainerConfigError, because configMapKeyRef cannot resolve.
+    app.kubernetes.io/component: config
 data:
   # Service DNS names, never localhost. In a pod, localhost is the pod.
   REDIS_URL: "redis://redis:6379/0"

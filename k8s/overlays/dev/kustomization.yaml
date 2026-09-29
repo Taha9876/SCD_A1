@@ -38,6 +38,22 @@ patches:
       - op: replace
         path: /spec/template/spec/containers/0/imagePullPolicy
         value: IfNotPresent
+  # Deterministic, no key, no network -- so a fresh cluster works before
+  # anybody has signed up for an API key. A patch, not a configMapGenerator
+  # merge, which cannot target a ConfigMap declared as a plain resource.
+  - target:
+      kind: ConfigMap
+      name: civicpulse-config
+    patch: |-
+      - op: replace
+        path: /data/TRIAGE_PROVIDER
+        value: rules
+      - op: replace
+        path: /data/LOG_LEVEL
+        value: DEBUG
+      - op: replace
+        path: /data/ENVIRONMENT
+        value: dev
 
 # Not in dev: the HPA (no load to scale on, and metrics-server may be absent),
 # the VPA (its CRD may not be installed), and the PDBs (with one replica a
@@ -49,13 +65,3 @@ images:
   - name: ghcr.io/OWNER/REPO/civicpulse-frontend
     newName: civicpulse-frontend
     newTag: dev
-
-configMapGenerator:
-  - name: civicpulse-config
-    behavior: merge
-    literals:
-      # Deterministic, no key, no network -- so a fresh cluster works before
-      # anybody has signed up for an API key.
-      - TRIAGE_PROVIDER=rules
-      - LOG_LEVEL=DEBUG
-      - ENVIRONMENT=dev

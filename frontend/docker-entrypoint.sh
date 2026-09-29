@@ -18,7 +18,12 @@ set -eu
 API_BASE_URL="${API_BASE_URL:-}"
 BACKEND_ORIGIN="${BACKEND_ORIGIN:-http://backend:8000}"
 
-CONFIG_PATH=/usr/share/nginx/html/config.js
+# /tmp, not the web root. Under Kubernetes the root filesystem is read-only and
+# /tmp is a writable emptyDir; under Compose /tmp is simply writable. nginx
+# serves this file at /config.js (see nginx.conf). An earlier version wrote into
+# /usr/share/nginx/html via a subPath mount -- but a subPath of an empty volume
+# makes Kubernetes create a DIRECTORY named config.js, and every pod crash-looped.
+CONFIG_PATH=/tmp/config.js
 
 # No secrets here, ever: anything written into this file is served to every
 # browser that loads the page. "It is minified" is not a defence, and neither

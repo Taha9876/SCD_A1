@@ -26,14 +26,22 @@ RUN npm run build
 # Stage 2: serve. nginx and ~200 KB of static files. No Node, no
 # node_modules, no TypeScript source.
 # ---------------------------------------------------------------------------
-FROM nginx:1.27-alpine AS runtime
+# 1.30 is the maintained stable line. The first CI Trivy scan failed on
+# 1.27-alpine with 40 HIGH/CRITICAL findings (openssl, c-ares, musl, libxml2,
+# zlib...): 1.27 is end-of-life, so its image froze on Alpine 3.21.3 and never
+# received a single one of those fixes.
+FROM nginx:1.30-alpine AS runtime
 
 # No `apk add gettext`: the official nginx image already ships envsubst (its
 # own entrypoint uses it for templates). An earlier version installed gettext
 # anyway -- `docker history` showed it adding 2.94 MB for nothing, and pinning
 # it to an exact Alpine revision would have broken the build the day Alpine
 # published the next one.
-RUN addgroup -g 1001 -S civic \
+#
+# `apk upgrade` pulls in Alpine security fixes published after the base image
+# was last rebuilt, so a scan fails only on issues that have no fix yet.
+RUN apk upgrade --no-cache \
+ && addgroup -g 1001 -S civic \
  && adduser -u 1001 -S civic -G civic
 
 # Only the built assets cross the stage boundary.
