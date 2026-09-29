@@ -105,12 +105,12 @@ spec:
             capabilities:
               drop: ["ALL"]
           volumeMounts:
-            # The entrypoint writes config.js into the web root and renders the
-            # nginx config, and nginx itself needs writable temp paths. With
-            # readOnlyRootFilesystem these must be emptyDirs.
-            - name: html-config
-              mountPath: /usr/share/nginx/html/config.js
-              subPath: config.js
+            # readOnlyRootFilesystem, so everything written at runtime needs an
+            # emptyDir: the rendered nginx config, nginx's cache and temp paths,
+            # and /tmp, where the entrypoint writes config.js (nginx serves it
+            # from there). Deliberately no subPath mount for config.js: a subPath
+            # of an empty volume makes Kubernetes create a DIRECTORY with that
+            # name, and the pods crash-looped on "config.js: Is a directory".
             - name: nginx-conf
               mountPath: /etc/nginx/conf.d
             - name: nginx-cache
@@ -118,8 +118,6 @@ spec:
             - name: tmp
               mountPath: /tmp
       volumes:
-        - name: html-config
-          emptyDir: {}
         - name: nginx-conf
           emptyDir: {}
         - name: nginx-cache
