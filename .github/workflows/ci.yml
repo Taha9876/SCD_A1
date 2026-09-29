@@ -220,7 +220,7 @@ jobs:
           docker load -i /tmp/frontend.tar
 
       - name: Scan backend
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: civicpulse-backend:ci
           format: table
@@ -232,7 +232,7 @@ jobs:
           ignore-unfixed: true
 
       - name: Scan frontend
-        uses: aquasecurity/trivy-action@0.29.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: civicpulse-frontend:ci
           format: table
