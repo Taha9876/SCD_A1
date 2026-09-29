@@ -1,0 +1,61 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# The production overlay, as Argo CD reconciles it (bonus: GitOps).
+#
+# Identical to overlays/prod except for ordering. cd.yml's imperative deploy
+# orders the rollout with `kubectl apply --selector` and explicit waits; Argo CD
+# applies everything in one sync, so the same order is expressed declaratively
+# as sync waves. Argo applies a wave, waits for it to be HEALTHY, then moves on:
+#
+#   wave -3  ConfigMap          Postgres reads it through configMapKeyRef
+#   wave -2  Postgres, Redis    the data layer must be up before migrating
+#   wave -1  migrate Job        a Sync hook, re-created on every sync
+#   wave  0  everything else    backend, frontend, Ingress, HPA, PDB, ...
+#
+# Nothing here changes what runs in production -- only annotations are added,
+# and `kubectl apply` ignores them, so cd.yml's deploy of overlays/prod and
+# Argo's sync of this overlay converge on the same objects.
+
+namespace: civicpulse
+
+resources:
+  - ../prod
+
+patches:
+  - target:
+      kind: ConfigMap
+      name: civicpulse-config
+    patch: |-
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: civicpulse-config
+        annotations:
+          argocd.argoproj.io/sync-wave: "-3"
+  - target:
+      labelSelector: app.kubernetes.io/component in (database,cache)
+    patch: |-
+      apiVersion: v1
+      kind: any
+      metadata:
+        name: any
+        annotations:
+          argocd.argoproj.io/sync-wave: "-2"
+  # A Job's pod template is immutable, so a plain resource would fail every
+  # sync that changes the image ("field is immutable"). As a Sync hook, Argo
+  # deletes the previous run and creates a fresh Job each sync, and waits for
+  # it to COMPLETE before starting wave 0 -- the same guarantee cd.yml gets
+  # from `kubectl wait --for=condition=complete`.
+  - target:
+      kind: Job
+      name: civicpulse-migrate
+    patch: |-
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: civicpulse-migrate
+        annotations:
+          argocd.argoproj.io/hook: Sync
+          argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+          argocd.argoproj.io/sync-wave: "-1"

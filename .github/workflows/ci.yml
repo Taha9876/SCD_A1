@@ -259,13 +259,13 @@ jobs:
             | tar xz kubeconform
           sudo mv kubeconform /usr/local/bin/
 
-      - name: Build and validate both overlays
+      - name: Build and validate every overlay and the Argo CD Application
         # Catches a typo'd apiVersion or a misspelled field in 20 seconds,
         # rather than 15 minutes later as a confusing kubectl error on the
         # cluster. The VPA and Ingress CRDs are not in the standard schema set,
         # hence the extra schema location.
         run: |
-          for overlay in dev prod; do
+          for overlay in dev prod gitops; do
             echo "=== $overlay ==="
             kustomize build "k8s/overlays/$overlay" > "/tmp/$overlay.yaml"
             kubeconform \
@@ -276,6 +276,8 @@ jobs:
               --schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
               "/tmp/$overlay.yaml"
           done
+          echo "=== argocd application ==="
+          kubeconform --strict --summary             --schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'             k8s/argocd/application.yaml
 
       - name: Assert no real secrets and no :latest in the manifests
         # PyYAML is required: without it the lint skips these checks and passes.
